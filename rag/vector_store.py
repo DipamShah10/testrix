@@ -1,8 +1,6 @@
 import os
 import logging
 import threading
-from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import HuggingFaceEmbeddings
 from rag.data_loader import load_data
 
 logger = logging.getLogger(__name__)
@@ -13,12 +11,20 @@ _INDEX_PATH = "faiss_index"
 
 
 def _get_db():
+    # Imported here, not at module load — langchain/FAISS is a heavy,
+    # optional dependency used only by the legacy /test-cases and
+    # /bug-analysis endpoints. A module-level import means any environment
+    # issue in this dependency chain (e.g. a blocked native DLL) takes down
+    # the entire app at startup, including Visual QA, which never calls this.
     global _db
     if _db is not None:
         return _db
     with _db_lock:
         if _db is not None:
             return _db
+
+        from langchain_community.vectorstores import FAISS
+        from langchain_community.embeddings import HuggingFaceEmbeddings
 
         embedding = HuggingFaceEmbeddings()
 

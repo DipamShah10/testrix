@@ -6,7 +6,7 @@ from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
 logger = logging.getLogger(__name__)
 
-_CANONICAL_WIDTH = 1440   # logical pixels (Figma @2x = 2880px raw → normalized to 1440)
+_CANONICAL_WIDTH = 1440   # fallback logical width when a frame's own width is unavailable
 _REGION_MIN_AREA = 400    # ignore diff blobs smaller than this (noise filter)
 _MAX_REGIONS = 10         # cap number of reported regions
 
@@ -37,18 +37,19 @@ def _load_image(data: bytes, label: str) -> Image.Image:
     return img
 
 
-def _normalize(img: Image.Image, label: str) -> Image.Image:
+def _normalize(img: Image.Image, label: str, canonical_width: int = _CANONICAL_WIDTH) -> Image.Image:
     """
-    Resize to canonical width preserving aspect ratio.
-    Both Figma @2x exports and Playwright @2x screenshots land at ~2880px wide.
-    We normalize to 1440 logical pixels so diffs are on the same grid.
+    Resize to the target frame's logical width, preserving aspect ratio.
+    Both Figma @2x exports and Playwright @2x screenshots land at 2x the
+    frame's logical width — we normalize both down to that same logical
+    width so diffs are computed on the same grid.
     """
     if img.width == 0:
         raise ValueError(f"{label}: zero-width image cannot be normalized")
-    scale = _CANONICAL_WIDTH / img.width
+    scale = canonical_width / img.width
     new_h = int(img.height * scale)
-    resized = img.resize((_CANONICAL_WIDTH, new_h), Image.LANCZOS)
-    logger.debug(f"{label}: {img.width}x{img.height} → {_CANONICAL_WIDTH}x{new_h}")
+    resized = img.resize((canonical_width, new_h), Image.LANCZOS)
+    logger.debug(f"{label}: {img.width}x{img.height} → {canonical_width}x{new_h}")
     return resized
 
 
@@ -116,29 +117,45 @@ def _find_regions(diff_gray: Image.Image, threshold: int = 30) -> list[tuple[int
     return regions[:_MAX_REGIONS]
 
 
+def _blur_for_diff(img: Image.Image, radius: int = 1) -> Image.Image:
+    """
+    Light Gaussian blur before differencing.
+    Eliminates 1–2px sub-pixel anti-aliasing artefacts that produce spurious
+    diffs on text and borders — the single biggest source of false positives.
+    """
+    return img.filter(ImageFilter.GaussianBlur(radius))
+
+
 def compare(
     figma_bytes: bytes,
     live_bytes: bytes,
     diff_threshold: float = 0.05,
+    canonical_width: int = _CANONICAL_WIDTH,
 ) -> CompareResult:
     """
-    Compare a Figma frame image against a live screenshot.
+    Compare a Figma frame image against a live full-page screenshot.
 
     diff_threshold: pixel-level sensitivity (0.0–1.0).
       Differences below this fraction of max channel distance are ignored (noise filter).
+    canonical_width: logical width (matching the Figma frame's own width) both
+      images are normalized to before diffing.
     """
     figma_img = _load_image(figma_bytes, "Figma")
     live_img = _load_image(live_bytes, "Live")
 
     # Normalize both to the same logical resolution
-    figma_norm = _normalize(figma_img, "Figma")
-    live_norm = _normalize(live_img, "Live")
+    figma_norm = _normalize(figma_img, "Figma", canonical_width)
+    live_norm = _normalize(live_img, "Live", canonical_width)
 
-    # Match heights by padding the shorter one
+    # Match heights by padding the shorter one to enable full-page comparison
     figma_norm, live_norm = _match_heights(figma_norm, live_norm)
 
-    # Pixel diff
-    diff = ImageChops.difference(figma_norm, live_norm)
+    # Pre-blur both images to suppress sub-pixel AA noise before diff
+    figma_blurred = _blur_for_diff(figma_norm)
+    live_blurred  = _blur_for_diff(live_norm)
+
+    # Pixel diff on blurred images (noise-reduced), but regions refer to original coords
+    diff = ImageChops.difference(figma_blurred, live_blurred)
     diff_gray = diff.convert("L")
 
     # Apply threshold — treat differences below threshold*255 as identical

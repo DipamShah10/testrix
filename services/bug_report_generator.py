@@ -1,15 +1,71 @@
 import base64
 import logging
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 
 from services.db import update_vqa_job
 from services.visual_comparator import CompareResult
 
 logger = logging.getLogger(__name__)
 
+_SEVERITY_ORDER = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
+_GROUP_SIMILARITY_THRESHOLD = 0.8
+
 
 def _b64(data: bytes | None) -> str | None:
     return base64.b64encode(data).decode() if data else None
+
+
+def _group_similar_issues(issues: list[dict]) -> list[dict]:
+    """
+    Collapse issues that are the same underlying defect hitting multiple
+    instances (e.g. the same "Shop Now" font-weight mismatch on 3 separate
+    product cards, or 4 copies of the vision model's identical "different
+    product image" observation) into one representative issue carrying an
+    occurrence count — instead of listing each instance as its own bug.
+
+    Grouped within the same issue_type by description text similarity (not
+    exact match — vision-generated descriptions vary in wording even when
+    describing the same underlying observation).
+    """
+    groups: list[dict] = []  # each: {"rep": issue, "occurrences": [issue, ...]}
+
+    for issue in issues:
+        desc = (issue.get("description") or "").lower()
+        itype = issue.get("issue_type")
+        match = None
+        for g in groups:
+            if g["rep"].get("issue_type") != itype:
+                continue
+            sim = SequenceMatcher(None, desc, (g["rep"].get("description") or "").lower()).ratio()
+            if sim >= _GROUP_SIMILARITY_THRESHOLD:
+                match = g
+                break
+        if match:
+            match["occurrences"].append(issue)
+        else:
+            groups.append({"rep": issue, "occurrences": [issue]})
+
+    grouped: list[dict] = []
+    for g in groups:
+        occurrences = g["occurrences"]
+        rep = dict(g["rep"])
+        if len(occurrences) > 1:
+            rep["occurrence_count"] = len(occurrences)
+            rep["affected_elements"] = list(dict.fromkeys(
+                o.get("element", "Unknown element") for o in occurrences
+            ))
+            # Worst severity among the duplicates wins — one instance being
+            # slightly more off than its siblings shouldn't get buried.
+            rep["severity"] = min(
+                (o.get("severity", "Low") for o in occurrences),
+                key=lambda s: _SEVERITY_ORDER.get(s, 99),
+            )
+        grouped.append(rep)
+
+    if len(grouped) < len(issues):
+        logger.info(f"Grouped {len(issues)} issue(s) into {len(grouped)} distinct finding(s)")
+    return grouped
 
 
 def build_page_report(
@@ -24,12 +80,21 @@ def build_page_report(
     Build a structured report dict for one page comparison.
     Images are stored as base64 strings so they can be embedded in the dashboard.
     """
+    # capture_failure / expected_variance are not design defects — they mean
+    # "this region couldn't be reliably compared" (blank capture, rotating
+    # carousel/UGC content). Counting them alongside real defects would let a
+    # handful of unrenderable regions drag a clean page down to "Critical" and
+    # bury the signal QA/dev teams actually need to act on.
+    _NON_DEFECT_TYPES = {"capture_failure", "expected_variance"}
+    defect_issues = _group_similar_issues([i for i in issues if i.get("issue_type") not in _NON_DEFECT_TYPES])
+    non_defect_issues = _group_similar_issues([i for i in issues if i.get("issue_type") in _NON_DEFECT_TYPES])
+
     severity_counts = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0}
-    for issue in issues:
+    for issue in defect_issues:
         sev = issue.get("severity", "Low")
         severity_counts[sev] = severity_counts.get(sev, 0) + 1
 
-    # Overall page health: worst severity found
+    # Overall page health: worst severity found among real defects only
     if severity_counts["Critical"] > 0:
         overall = "Critical"
     elif severity_counts["High"] > 0:
@@ -47,9 +112,11 @@ def build_page_report(
         "figma_frame": figma_frame.get("name", "Unknown"),
         "overall_severity": overall,
         "diff_percent": compare_result.diff_percent,
-        "issue_count": len(issues),
+        "issue_count": len(defect_issues),
         "severity_counts": severity_counts,
-        "issues": issues,
+        "issues": defect_issues,
+        "needs_recheck_count": len(non_defect_issues),
+        "needs_recheck_issues": non_defect_issues,
         "figma_image_b64": _b64(figma_frame.get("image_bytes")),
         "live_image_b64": _b64(live_screenshot),
         "diff_image_b64": _b64(compare_result.diff_image),
@@ -69,6 +136,7 @@ def build_full_report(
     Never stores the raw FIGMA_API_TOKEN — only the URL/file key.
     """
     total_issues = sum(r["issue_count"] for r in page_reports)
+    total_needs_recheck = sum(r.get("needs_recheck_count", 0) for r in page_reports)
     all_severities = [r["overall_severity"] for r in page_reports if r["overall_severity"] != "Pass"]
 
     severity_order = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3, "Pass": 4}
@@ -86,6 +154,7 @@ def build_full_report(
         "figma_url": figma_url,
         "overall_severity": overall,
         "total_issues": total_issues,
+        "needs_recheck_count": total_needs_recheck,
         "severity_counts": total_counts,
         "pages_tested": len(page_reports),
         "pages_passed": sum(1 for r in page_reports if r["overall_severity"] == "Pass"),
@@ -122,7 +191,7 @@ def _strip_heavy_images(report: dict) -> dict:
         page.pop("live_image_b64", None)
         page.pop("diff_image_b64", None)
         page.pop("diff_mask_b64", None)
-        for issue in page.get("issues", []):
+        for issue in page.get("issues", []) + page.get("needs_recheck_issues", []):
             issue.pop("expected_crop_b64", None)
             issue.pop("actual_crop_b64", None)
             issue.pop("diff_crop_b64", None)

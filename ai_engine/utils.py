@@ -6,10 +6,12 @@ logger = logging.getLogger(__name__)
 
 
 def _strip_markdown(content: str) -> str:
-    match = re.search(r"```(?:json)?\s*([\s\S]*?)```", content)
-    if match:
-        return match.group(1)
-    return content
+    content = content.strip()
+    # Remove opening fence (```json, ```, etc.) anchored at the start
+    content = re.sub(r"^```[a-zA-Z]*\s*\n?", "", content)
+    # Remove closing fence anchored at the end
+    content = re.sub(r"\n?```\s*$", "", content.strip())
+    return content.strip()
 
 
 def extract_json_object(content: str) -> dict | None:

@@ -63,6 +63,10 @@
     textarea:focus { outline: none; border-color: #3b82f6; }
 
     .btn-row { display: flex; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
+    @media (max-width: 480px) {
+      .btn-row { display: grid; grid-template-columns: 1fr 1fr; }
+      .btn-row button:last-child:nth-child(odd) { grid-column: 1 / -1; }
+    }
 
     button {
       padding: 9px 18px;
@@ -588,6 +592,19 @@
     .issue-card.high     { border-left: 4px solid #ea580c; }
     .issue-card.medium   { border-left: 4px solid #2563eb; }
     .issue-card.low      { border-left: 4px solid #6b7280; }
+    .issue-card.needs-recheck { border-left: 4px solid #9333ea; background: #faf5ff; }
+
+    .vqa-recheck-section { margin-top: 20px; }
+    .vqa-recheck-header {
+      font-size: 13px;
+      font-weight: 600;
+      color: #7e22ce;
+      background: #faf5ff;
+      border: 1px solid #e9d5ff;
+      border-radius: 8px;
+      padding: 8px 12px;
+      margin-bottom: 12px;
+    }
 
     /* Issue header row */
     .issue-header {
@@ -684,7 +701,7 @@
     }
     .issue-crop-no-img svg { opacity: .4; }
 
-    /* Suggested fix */
+    /* Suggested fix (legacy inline) */
     .issue-fix {
       margin-top: 12px;
       background: #f0fdf4; border: 1px solid #bbf7d0;
@@ -695,6 +712,75 @@
       letter-spacing: 0.7px; color: #059669; display: block; margin-bottom: 4px;
     }
     .issue-fix-text { font-size: 12px; color: #065f46; line-height: 1.55; }
+
+    /* ── Developer Fix Accordion ── */
+    .dev-fix-accordion {
+      margin-top: 14px;
+      border: 1.5px solid #3b82f6;
+      border-radius: 10px;
+      overflow: hidden;
+    }
+    .dev-fix-toggle {
+      width: 100%; display: flex; align-items: center; gap: 10px;
+      padding: 10px 14px; background: #eff6ff;
+      border: none; cursor: pointer; text-align: left;
+      font-size: 13px; font-weight: 700; color: #1d4ed8;
+      transition: background .15s;
+    }
+    .dev-fix-toggle:hover { background: #dbeafe; }
+    .dev-fix-toggle-title { flex: 1; display: flex; align-items: center; gap: 8px; }
+    .dev-fix-chevron { font-size: 10px; color: #3b82f6; transition: transform .2s; }
+    .dev-fix-accordion.open .dev-fix-chevron { transform: rotate(180deg); }
+    .dev-fix-body {
+      display: none; padding: 16px; background: #fff;
+      border-top: 1px solid #bfdbfe;
+    }
+    .dev-fix-accordion.open .dev-fix-body { display: block; }
+    .dev-fix-section { margin-bottom: 14px; }
+    .dev-fix-section:last-child { margin-bottom: 0; }
+    .dev-fix-section-title {
+      font-size: 10px; font-weight: 700; text-transform: uppercase;
+      letter-spacing: 0.8px; color: #6b7280; margin-bottom: 6px;
+    }
+    .dev-fix-text { font-size: 12.5px; color: #374151; line-height: 1.65; margin: 0; }
+    .dev-fix-list { margin: 0; padding-left: 20px; }
+    .dev-fix-list li { font-size: 12.5px; color: #374151; line-height: 1.65; margin-bottom: 3px; }
+    .dev-fix-code {
+      background: #111827; color: #e5e7eb;
+      border-radius: 7px; padding: 12px 14px;
+      font-size: 12px; font-family: 'Consolas','Courier New',monospace;
+      line-height: 1.6; overflow-x: auto; white-space: pre; margin: 0;
+    }
+    .dev-fix-responsive {
+      background: #fff7ed; border-left: 3px solid #f59e0b;
+      padding: 8px 12px; border-radius: 0 6px 6px 0;
+    }
+    .dev-fix-meta {
+      display: flex; gap: 20px; flex-wrap: wrap;
+      padding-top: 12px; border-top: 1px solid #f3f4f6; margin-top: 14px;
+    }
+    .dev-fix-chips-group { display: flex; flex-direction: column; gap: 5px; }
+    .dev-fix-chips-label {
+      font-size: 10px; font-weight: 700; text-transform: uppercase;
+      letter-spacing: 0.7px; color: #9ca3af;
+    }
+    .dev-fix-chips { display: flex; flex-wrap: wrap; gap: 5px; }
+    .dev-fix-chip {
+      font-size: 11px; padding: 2px 9px; border-radius: 20px; font-weight: 600;
+    }
+    .dev-fix-chip.device { background: #ede9fe; color: #6d28d9; }
+    .dev-fix-chip.component { background: #fef3c7; color: #92400e; }
+    .complexity-badge {
+      font-size: 10px; font-weight: 700; text-transform: uppercase;
+      letter-spacing: 0.5px; padding: 2px 8px; border-radius: 20px;
+    }
+    .complexity-badge.easy   { background: #d1fae5; color: #065f46; }
+    .complexity-badge.medium { background: #fef3c7; color: #92400e; }
+    .complexity-badge.complex { background: #fee2e2; color: #991b1b; }
+    .effort-badge {
+      font-size: 10px; font-weight: 600; color: #6b7280;
+      background: #f3f4f6; padding: 2px 8px; border-radius: 20px;
+    }
     .pass-banner {
       background: #f0fdf4;
       border: 1.5px solid #bbf7d0;
@@ -931,8 +1017,8 @@
     <h4>▶▶ Execute Test Cases with Playwright</h4>
     <div class="run-modal-field">
       <label>Target Base URL</label>
-      <input id="base-url" type="text" value="http://localhost:3000"
-        placeholder="http://localhost:3000" />
+      <input id="base-url" type="text" value="http://localhost:8000"
+        placeholder="http://localhost:8000" />
     </div>
     <div class="run-modal-field">
       <label>Auth Token (optional)</label>
@@ -984,6 +1070,10 @@
       <button class="btn-primary" id="vqa-start-btn" onclick="startVisualQA()">▶ Start Visual QA</button>
       <button class="btn-secondary" onclick="clearVisualQA()">✕ Clear</button>
       <button class="btn-success" id="vqa-export-btn" onclick="exportVQAReport()" style="display:none;">⬇ Export JSON Report</button>
+    </div>
+    <div class="btn-row" style="margin-top:10px; align-items:center; gap:8px;">
+      <input type="text" id="vqa-load-job-id" placeholder="Paste a job ID to view a past report…" style="flex:1; min-width:220px;">
+      <button class="btn-secondary" onclick="loadVQAJobById()">Load Report</button>
     </div>
   </div>
 
@@ -1037,6 +1127,10 @@
       <div class="vqa-kpi">
         <div class="kpi-label">Pages Tested</div>
         <div class="kpi-value" id="vqa-kpi-pages">0</div>
+      </div>
+      <div class="vqa-kpi" title="Regions that couldn't be reliably compared (blank/failed capture or rotating carousel content) — not counted as defects, but worth a manual look.">
+        <div class="kpi-label">Needs Recheck</div>
+        <div class="kpi-value" id="vqa-kpi-recheck" style="color:#9333ea;">0</div>
       </div>
     </div>
 
@@ -1231,7 +1325,7 @@ function hideStatus() {
 /* ── Main analysis using SSE stream ── */
 async function runQA() {
   const input = document.getElementById("input").value.trim();
-  if (!input) { alert("Please enter a bug or feature description."); return; }
+  if (!input) { showStatus("Please enter a bug or feature description.", true); return; }
 
   const btn = document.getElementById("analyzeBtn");
   btn.disabled = true;
@@ -1336,7 +1430,7 @@ function renderTable(tests) {
         <td>${tc.priority || "—"}</td>
         <td>${expected}</td>
         <td>${steps.length
-          ? `<button class="steps-btn" onclick="openModal(${i})">View ${steps.length}</button>`
+          ? `<button class="steps-btn" onclick="openModal(${i})">Steps (${steps.length})</button>`
           : "—"}</td>
       </tr>`;
   }).join("");
@@ -1418,7 +1512,7 @@ function downloadPostman() {
       schema: "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
     },
     item: items,
-    variable: [{ key: "base_url", value: "http://localhost:3000" }]
+    variable: [{ key: "base_url", value: "http://localhost:8000" }]
   };
 
   triggerDownload(
@@ -1431,6 +1525,8 @@ function downloadPostman() {
 /* ── Clear ── */
 function clearAll() {
   document.getElementById("input").value = "";
+  document.getElementById("search").value = "";
+  document.getElementById("type-filter").value = "";
   document.getElementById("bug-output").textContent = "No data yet — run an analysis above.";
   document.querySelector("#tc-table tbody").innerHTML =
     "<tr><td colspan='6' style='text-align:center;color:#9ca3af;'>No data yet</td></tr>";
@@ -1677,9 +1773,9 @@ async function startVisualQA() {
   const password   = document.getElementById("vqa-password").value.trim() || null;
   const pages      = [...document.querySelectorAll(".pages-row input:checked")].map(el => el.value);
 
-  if (!shopifyUrl) { alert("Please enter the Shopify store URL."); return; }
-  if (!figmaUrl)   { alert("Please enter the Figma file URL."); return; }
-  if (!pages.length) { alert("Select at least one page to test."); return; }
+  if (!shopifyUrl) { vqaShowError("Please enter the Shopify store URL."); return; }
+  if (!figmaUrl)   { vqaShowError("Please enter the Figma file URL."); return; }
+  if (!pages.length) { vqaShowError("Select at least one page to test."); return; }
 
   // Reset UI
   document.getElementById("vqa-error").style.display = "none";
@@ -1746,6 +1842,7 @@ function renderVQAReport(report) {
   document.getElementById("vqa-kpi-medium").textContent   = sc.Medium   || 0;
   document.getElementById("vqa-kpi-low").textContent      = sc.Low      || 0;
   document.getElementById("vqa-kpi-pages").textContent    = report.pages_tested || 0;
+  document.getElementById("vqa-kpi-recheck").textContent  = report.needs_recheck_count || 0;
 
   // Page tabs
   const pages = report.page_reports || [];
@@ -1788,16 +1885,29 @@ function showVQAPage(idx) {
 
   // Issues
   const issues = page.issues || [];
+  const recheckIssues = page.needs_recheck_issues || [];
   document.getElementById("vqa-issue-count").textContent =
     issues.length ? `${issues.length} issue${issues.length > 1 ? "s" : ""} found` : "";
 
+  const recheckHtml = recheckIssues.length ? `
+    <div class="vqa-recheck-section">
+      <div class="vqa-recheck-header" title="These regions couldn't be reliably compared — a blank/failed capture or a carousel/UGC region caught mid-rotation. Not counted as defects; worth a quick manual look.">
+        &#x26A0; ${recheckIssues.length} region${recheckIssues.length > 1 ? "s" : ""} need${recheckIssues.length > 1 ? "" : "s"} manual recheck (not counted as defects)
+      </div>
+      ${recheckIssues.map((iss, i) => renderIssueCard(iss, i, idx, "recheck")).join("")}
+    </div>` : "";
+
   if (!issues.length) {
     document.getElementById("vqa-issue-list").innerHTML =
-      `<div class="pass-banner">No issues found on ${page.page} — design matches live site.</div>`;
+      `<div class="pass-banner">No issues found on ${page.page} — design matches live site.</div>${recheckHtml}`;
     return;
   }
 
-  document.getElementById("vqa-issue-list").innerHTML = issues.map((iss, i) => {
+  document.getElementById("vqa-issue-list").innerHTML =
+    issues.map((iss, i) => renderIssueCard(iss, i, idx, "issue")).join("") + recheckHtml;
+}
+
+function renderIssueCard(iss, i, idx, kind) {
     const sev     = (iss.severity || "low").toLowerCase();
     const diffPct = iss.diff_percent || 0;
     const diffCls = diffPct >= 40 ? "high-diff" : diffPct >= 15 ? "medium-diff" : "";
@@ -1844,14 +1954,10 @@ function showVQAPage(idx) {
         ${hasDiff ? makeCrop(iss.diff_screenshot_url, iss.diff_crop_b64, "Diff Heatmap", "diff-lbl diff") : ""}
       </div>` : "";
 
-    const fix = iss.suggested_fix ? `
-      <div class="issue-fix">
-        <span class="issue-fix-label">Suggested Fix</span>
-        <span class="issue-fix-text">${escHtml(iss.suggested_fix)}</span>
-      </div>` : "";
+    const fix = buildDevFixAccordion(iss, `${idx}_${i}`);
 
     return `
-      <div class="issue-card ${sev}" id="issue-card-${i}">
+      <div class="issue-card ${sev}${kind === 'recheck' ? ' needs-recheck' : ''}" id="issue-card-${kind}-${i}">
         <div class="issue-header">
           <div class="issue-header-left">
             <span class="badge ${sev}">${iss.severity || "Low"}</span>
@@ -1865,13 +1971,129 @@ function showVQAPage(idx) {
         ${crops}
         ${fix}
       </div>`;
-  }).join("");
+}
+
+function toggleDevFix(key) {
+  const el = document.getElementById("dev-fix-" + key);
+  if (el) el.classList.toggle("open");
+}
+
+function buildDevFixAccordion(iss, key) {
+  const fr = iss.fix_recommendation;
+  if (!fr && !iss.suggested_fix) return "";
+
+  if (!fr) {
+    return `
+      <div class="issue-fix">
+        <span class="issue-fix-label">Suggested Fix</span>
+        <span class="issue-fix-text">${escHtml(iss.suggested_fix)}</span>
+      </div>`;
+  }
+
+  const cplx = (fr.fix_complexity || "Medium").toLowerCase();
+  const effort = fr.estimated_effort || "";
+
+  const probCauses = Array.isArray(fr.probable_causes)
+    ? fr.probable_causes.map(c => `<li>${escHtml(c)}</li>`).join("") : "";
+  const fixSteps = Array.isArray(fr.frontend_fix)
+    ? fr.frontend_fix.map(s => `<li>${escHtml(s)}</li>`).join("") : "";
+  const deviceChips = Array.isArray(fr.affected_devices)
+    ? fr.affected_devices.map(d => `<span class="dev-fix-chip device">${escHtml(d)}</span>`).join("") : "";
+  const componentChips = Array.isArray(fr.impacted_components)
+    ? fr.impacted_components.map(c => `<span class="dev-fix-chip component">${escHtml(c)}</span>`).join("") : "";
+
+  const cssSection = fr.css_snippet ? `
+    <div class="dev-fix-section">
+      <div class="dev-fix-section-title">CSS / Code Snippet</div>
+      <pre class="dev-fix-code">${escHtml(fr.css_snippet)}</pre>
+    </div>` : "";
+
+  const responsiveSection = fr.responsive_fix ? `
+    <div class="dev-fix-section">
+      <div class="dev-fix-section-title">Responsive Fix</div>
+      <p class="dev-fix-text dev-fix-responsive">${escHtml(fr.responsive_fix)}</p>
+    </div>` : "";
+
+  const severitySection = fr.severity_reason ? `
+    <div class="dev-fix-section">
+      <div class="dev-fix-section-title">Severity Reason</div>
+      <p class="dev-fix-text">${escHtml(fr.severity_reason)}</p>
+    </div>` : "";
+
+  const metaSection = (deviceChips || componentChips) ? `
+    <div class="dev-fix-meta">
+      ${deviceChips ? `<div class="dev-fix-chips-group">
+        <span class="dev-fix-chips-label">Affected Devices</span>
+        <div class="dev-fix-chips">${deviceChips}</div>
+      </div>` : ""}
+      ${componentChips ? `<div class="dev-fix-chips-group">
+        <span class="dev-fix-chips-label">Impacted Components</span>
+        <div class="dev-fix-chips">${componentChips}</div>
+      </div>` : ""}
+    </div>` : "";
+
+  return `
+    <div class="dev-fix-accordion" id="dev-fix-${key}">
+      <button class="dev-fix-toggle" onclick="toggleDevFix('${key}')">
+        <span class="dev-fix-toggle-title">&#x1F527; Developer Fix Assistant</span>
+        <span class="complexity-badge ${cplx}">${escHtml(fr.fix_complexity || "Medium")}</span>
+        ${effort ? `<span class="effort-badge">${escHtml(effort)}</span>` : ""}
+        <span class="dev-fix-chevron">&#x25BC;</span>
+      </button>
+      <div class="dev-fix-body">
+        ${fr.root_cause ? `<div class="dev-fix-section">
+          <div class="dev-fix-section-title">Root Cause</div>
+          <p class="dev-fix-text">${escHtml(fr.root_cause)}</p>
+        </div>` : ""}
+        ${probCauses ? `<div class="dev-fix-section">
+          <div class="dev-fix-section-title">Probable Developer Causes</div>
+          <ul class="dev-fix-list">${probCauses}</ul>
+        </div>` : ""}
+        ${fixSteps ? `<div class="dev-fix-section">
+          <div class="dev-fix-section-title">Frontend Fix Steps</div>
+          <ol class="dev-fix-list">${fixSteps}</ol>
+        </div>` : ""}
+        ${cssSection}
+        ${responsiveSection}
+        ${severitySection}
+        ${metaSection}
+      </div>
+    </div>`;
 }
 
 function vqaShowError(msg) {
   const el = document.getElementById("vqa-error");
   el.textContent = "Error: " + msg;
   el.style.display = "block";
+}
+
+async function loadVQAJobById() {
+  const id = (document.getElementById("vqa-load-job-id").value || "").trim();
+  if (!id) { vqaShowError("Enter a job ID first."); return; }
+
+  if (vqaPollTimer) clearInterval(vqaPollTimer);
+  document.getElementById("vqa-error").style.display = "none";
+
+  try {
+    const res = await fetch(`/visual-qa/${encodeURIComponent(id)}`);
+    if (!res.ok) {
+      vqaShowError(res.status === 404 ? `No job found with ID "${id}"` : `Server returned ${res.status}`);
+      return;
+    }
+    const job = await res.json();
+    if (job.status !== "complete" || !job.result) {
+      vqaShowError(`Job "${id}" is ${job.status || "not finished"} — nothing to show yet.`);
+      return;
+    }
+    vqaJobId = id;
+    vqaReport = job.result;
+    document.getElementById("vqa-results").style.display = "";
+    document.getElementById("vqa-export-btn").style.display = "";
+    document.getElementById("vqa-progress").className = "progress-steps";
+    renderVQAReport(job.result);
+  } catch (e) {
+    vqaShowError("Failed to load job: " + e.message);
+  }
 }
 
 function clearVisualQA() {
@@ -1947,7 +2169,7 @@ async function startAICrawl() {
   const maxPages = parseInt(document.getElementById("crawl-max-pages").value) || 20;
   const maxDepth = parseInt(document.getElementById("crawl-max-depth").value) || 2;
 
-  if (!seedUrl) { alert("Please enter a seed URL."); return; }
+  if (!seedUrl) { crawlShowError("Please enter a seed URL."); return; }
 
   document.getElementById("crawl-error").style.display   = "none";
   document.getElementById("crawl-results").style.display = "none";

@@ -123,6 +123,9 @@ def main() -> None:
         raise ValueError("Requirements path is required. Pass --requirements or set REQUIREMENTS_PATH.")
     if not args.url:
         raise ValueError("Target URL is required. Pass --url or set TARGET_URL.")
+    settings = get_settings()
+    if not settings.groq_api_key:
+        raise RuntimeError("GROQ_API_KEY is not set. Add it to your .env file.")
 
     configure_logging(args.log_level)
     log = logging.getLogger(__name__)

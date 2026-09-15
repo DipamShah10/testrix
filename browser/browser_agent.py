@@ -1,4 +1,5 @@
 import asyncio
+from urllib.parse import urlsplit, urlunsplit
 
 from playwright.async_api import BrowserContext, Page, async_playwright
 
@@ -48,6 +49,12 @@ class BrowserAgent:
         ]
         return await asyncio.gather(*tasks)
 
+    @staticmethod
+    def _build_page_url(base_url: str, route: str) -> str:
+        parts = urlsplit(base_url)
+        path = "/" + route.strip("/") if route not in ("", "/") else "/"
+        return urlunsplit((parts.scheme, parts.netloc, path, parts.query, parts.fragment))
+
     async def _inspect_route(
         self,
         context: BrowserContext,
@@ -57,7 +64,7 @@ class BrowserAgent:
         semaphore: asyncio.Semaphore,
     ) -> BrowserObservation:
         async with semaphore:
-            page_url = f"{base_url.rstrip('/')}/{route.lstrip('/')}" if route != "/" else base_url.rstrip("/") + "/"
+            page_url = self._build_page_url(base_url, route)
             page = None
             console_errors: list[str] = []
             network_failures: list[str] = []

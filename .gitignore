@@ -42,5 +42,8 @@ server*.err
 
 # Generated output
 artifacts/crawl/
+artifacts/debug/
+artifacts/screenshots/
 screenshots/
 reports/
+.gstack/

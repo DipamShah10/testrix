@@ -97,6 +97,40 @@ async def classify_issue(issue: dict) -> dict:
     user_impact = issue.get("user_impact", "")
     diff_percent = issue.get("diff_percent", 0.0)
 
+    # Non-defects: a blank/failed capture or expected dynamic-content variance
+    # (carousel slide, UGC grid) is not a design mismatch — don't let element-name
+    # keywords (e.g. "hero", "nav") force these to Critical/High.
+    if issue_type == "capture_failure":
+        issue["severity"] = "Medium"
+        issue["rule_severity"] = "Medium"
+        return issue
+    if issue_type == "expected_variance":
+        issue["severity"] = "Low"
+        issue["rule_severity"] = "Low"
+        return issue
+
+    # Typography issues from typography_diff carry a real magnitude score
+    # (computed from actual font-family/size/weight/color deltas) — use that
+    # directly instead of bumping every CTA/hero typography hit to High
+    # regardless of whether the mismatch is a single weight step or a
+    # completely wrong typeface. This is deterministic and skips the LLM call.
+    # Dimension/spacing issues (from geometry_diff) carry the same kind of
+    # real magnitude score, computed from actual measured pixel deltas — same
+    # deterministic tiering applies.
+    if issue_type in ("typography", "dimension", "spacing") and "magnitude_score" in issue:
+        score = issue["magnitude_score"]
+        if score >= 50:
+            severity = "Critical"
+        elif score >= 30:
+            severity = "High"
+        elif score >= 15:
+            severity = "Medium"
+        else:
+            severity = "Low"
+        issue["severity"] = severity
+        issue["rule_severity"] = severity
+        return issue
+
     # Step 1: rule-based fast pass
     rule_severity = _rule_based(element, diff_percent)
 

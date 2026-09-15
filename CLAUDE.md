@@ -63,8 +63,27 @@ testrix/
 │   ├── bugs.txt                    # Known bugs (RAG training data)
 │   └── test_cases.txt              # Example test case templates
 │
+├── visual/                         # Section-level visual comparison pipeline
+│   ├── figma_section_extractor.py  # Crops named sections from Figma frame PNG
+│   ├── section_matcher.py          # Greedy Figma↔DOM section pairing (semantic + positional)
+│   ├── section_comparator.py       # SSIM + pixel diff per matched section pair
+│   └── section_alignment_engine.py # DOM coordinate normalization + region→section lookup
+│
+├── qa/
+│   └── fix_recommendation_engine.py # AI-generated developer-ready fix guides per issue
+│
+├── tests/                          # pytest suite (104 tests, no external calls)
+│   ├── test_utils.py
+│   ├── test_severity_classifier.py
+│   ├── test_visual_comparator.py
+│   ├── test_section_alignment.py
+│   ├── test_section_matcher.py
+│   ├── test_figma_extractor.py
+│   ├── test_shopify_scraper.py
+│   └── test_fix_recommendation.py
+│
 └── ui/
-    └── index.html                  # Frontend SPA (Bug QA + Visual QA tabs)
+    └── index.html                  # Frontend SPA (Bug QA + Visual QA + AI Crawl tabs)
 ```
 
 ## Running the Project
@@ -124,11 +143,17 @@ User Input → Agent Manager → Bug Agent + Test Case Service (parallel)
 
 Visual QA:
 POST /visual-qa → MongoDB job (pending) → BackgroundTask
-    ├── Figma REST API → frames PNG @2x
-    ├── Playwright (thread pool) → Shopify screenshots
-    ├── Pillow pixel diff → BFS regions
-    ├── Groq vision → issue analysis per page
+    ├── Figma REST API → frames PNG @2x + typography tokens
+    ├── Playwright (thread pool) → Shopify screenshots + DOM section extraction
+    ├── Section pipeline (preferred):
+    │   ├── Crop Figma sections + match to live DOM sections (semantic + positional)
+    │   ├── SSIM + pixel diff per section pair
+    │   └── Groq vision → issue analysis per significant section pair
+    ├── Full-page fallback (when section pipeline has < 2 pairs):
+    │   ├── Pillow pixel diff → BFS regions
+    │   └── Groq vision → issue analysis per region
     ├── Rule-based + LLM severity classification
+    ├── AI fix recommendation per issue (root cause, CSS snippet, effort estimate)
     └── MongoDB job (complete) → UI polls result
 ```
 
@@ -152,16 +177,23 @@ POST /visual-qa → MongoDB job (pending) → BackgroundTask
 | `GROQ_MODEL` | No | Defaults to `llama-3.3-70b-versatile` |
 | `FIGMA_API_TOKEN` | For Visual QA | Figma Personal Access Token |
 | `MONGODB_URI` | Yes | Defaults to `mongodb://localhost:27017` |
-| `CORS_ORIGINS` | No | Defaults to `*` |
+| `CORS_ORIGINS` | No | Defaults to `*` — restrict before production |
+| `TESTRIX_API_KEY` | No | Enables `X-API-Key` header auth on all endpoints; leave blank for dev mode |
 
-## No Test Framework
+## Running Tests
 
-No unit or integration tests. The system relies on LLM-generated outputs and RAG context. To expand coverage, `pytest` with mocked LLM responses is the recommended path.
+```bash
+pytest           # run all 104 tests
+pytest -q        # quiet mode
+pytest tests/test_visual_comparator.py  # single file
+```
+
+Tests cover pure/deterministic code only. LLM-dependent paths are mocked with `unittest.mock`. No external API calls are made during tests.
 
 ## Known Limitations
 
 - CORS allows all origins — restrict `CORS_ORIGINS` before production.
-- No authentication on any endpoint.
+- Authentication is optional (`TESTRIX_API_KEY`) — disabled by default in dev mode.
 - Rate limiting via `slowapi`: 10 req/min on `/qa-ai` and `/visual-qa`, 20 req/min on legacy endpoints.
 - LLM responses can occasionally fail JSON parsing; regex fallback returns raw text.
 - Playwright Visual QA runs sync in a thread pool — concurrent jobs share the default pool.

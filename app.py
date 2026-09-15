@@ -3,9 +3,10 @@ import json
 import logging
 import asyncio
 
-from fastapi import FastAPI, Request, BackgroundTasks
+from fastapi import FastAPI, Request, BackgroundTasks, Depends, HTTPException, Security
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
@@ -14,12 +15,16 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from dotenv import load_dotenv
 
-from services.test_case_service import generate_test_cases
+# generate_test_cases pulls in langchain/FAISS (rag.vector_store) transitively,
+# which is only needed by the deprecated /test-cases endpoint below — imported
+# lazily inside that handler so a broken optional RAG dependency (e.g. a
+# blocked native DLL) can't take down the entire app, including Visual QA,
+# which never touches this code path.
 from services.bug_analysis_service import analyze_bug as basic_bug_analysis
 from agents.bug_agent import analyze_bug as agent_analyze_bug
 from agents.agent_manager import run_qa_ai
 from services.test_runner import run_tests
-from agents.visual_qa_agent import run_visual_qa
+from agents.visual_qa_agent import run_visual_qa, run_single_section_qa, run_multi_section_qa
 from agents.ai_crawl_agent import run_ai_crawl
 from services.db import (
     get_history, get_history_item, delete_history_item,
@@ -45,7 +50,25 @@ for _var in _REQUIRED_ENV:
 
 limiter = Limiter(key_func=get_remote_address)
 
-app = FastAPI(title="Testrix", version="2.0.0", description="AI-powered QA automation")
+# ── Optional API key auth ─────────────────────────────────────────────────────
+# Set TESTRIX_API_KEY in .env to enable. Leave unset to run without auth (dev mode).
+_API_KEY_VALUE = os.environ.get("TESTRIX_API_KEY", "")
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+async def verify_api_key(key: str | None = Security(_api_key_header)) -> None:
+    if not _API_KEY_VALUE:
+        return  # auth disabled — dev mode
+    if key != _API_KEY_VALUE:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
+app = FastAPI(
+    title="Testrix",
+    version="2.0.0",
+    description="AI-powered QA automation",
+    dependencies=[Depends(verify_api_key)],
+)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -65,6 +88,9 @@ app.mount("/ui", StaticFiles(directory="ui"), name="ui")
 from pathlib import Path as _Path
 _Path("artifacts/screenshots").mkdir(parents=True, exist_ok=True)
 app.mount("/screenshots", StaticFiles(directory="artifacts/screenshots"), name="screenshots")
+
+_Path("artifacts/reports").mkdir(parents=True, exist_ok=True)
+app.mount("/reports", StaticFiles(directory="artifacts/reports"), name="reports")
 
 
 # ---------- Request models ----------
@@ -97,6 +123,40 @@ class VisualQARequest(BaseModel):
     )
     shopify_password: str | None = Field(default=None, description="Password for password-protected stores")
     diff_threshold: float = Field(default=0.05, ge=0.0, le=1.0, description="Pixel diff sensitivity (0–1)")
+    exclude_sections: list[str] = Field(
+        default_factory=list,
+        description="Section types to skip entirely, e.g. ['header', 'footer', 'collection']",
+    )
+    target_section: str | None = Field(
+        default=None,
+        description=(
+            "Free-text section name/heading to scope the run to a single section, "
+            "e.g. 'Curated Selection (Featured Pieces)', instead of the whole page. "
+            "When set, only the first entry in `pages` is used. Compares typography, "
+            "element dimensions, and spacing for that section — full pixel/vision "
+            "diff scoped to one section isn't supported yet. Mutually exclusive with "
+            "`section_limit`."
+        ),
+    )
+    section_limit: int | None = Field(
+        default=None, ge=1, le=20,
+        description=(
+            "Scope the run to the first N real-content sections of the page, in page "
+            "order, after dropping any excluded section types (see exclude_sections) "
+            "— e.g. section_limit=3 tests the first 3 sections a visitor would "
+            "actually scroll through, skipping the header/footer even if excluded "
+            "types would otherwise be counted. Only the first entry in `pages` is "
+            "used. Mutually exclusive with `target_section`."
+        ),
+    )
+    include_typography: bool = Field(
+        default=True,
+        description=(
+            "Whether to run typography comparison. Only applies to target_section/"
+            "section_limit runs — set to False to check only dimensions/spacing when "
+            "typography has already been separately verified."
+        ),
+    )
 
 
 class CrawlRequest(BaseModel):
@@ -200,6 +260,7 @@ async def ai_crawl_status(job_id: str):
 @limiter.limit("20/minute")
 async def test_cases(request: Request, body: FeatureRequest):
     try:
+        from services.test_case_service import generate_test_cases
         result = await generate_test_cases(body.feature)
         return {"result": result}
     except Exception as e:
@@ -313,17 +374,53 @@ async def visual_qa_start(request: Request, body: VisualQARequest, background_ta
         create_vqa_job, body.shopify_url, body.figma_url, body.pages
     )
 
-    background_tasks.add_task(
-        run_visual_qa,
-        job_id=job_id,
-        shopify_url=body.shopify_url,
-        figma_url=body.figma_url,
-        pages=body.pages,
-        shopify_password=body.shopify_password,
-        diff_threshold=body.diff_threshold,
-    )
+    if body.target_section:
+        page_name = body.pages[0] if body.pages else "home"
+        background_tasks.add_task(
+            run_single_section_qa,
+            job_id=job_id,
+            shopify_url=body.shopify_url,
+            figma_url=body.figma_url,
+            page_name=page_name,
+            target_section=body.target_section,
+            shopify_password=body.shopify_password,
+            include_typography=body.include_typography,
+        )
+        logger.info(
+            f"Visual QA job started — id={job_id}, page={page_name}, "
+            f"target_section={body.target_section!r}, include_typography={body.include_typography}"
+        )
+    elif body.section_limit:
+        page_name = body.pages[0] if body.pages else "home"
+        background_tasks.add_task(
+            run_multi_section_qa,
+            job_id=job_id,
+            shopify_url=body.shopify_url,
+            figma_url=body.figma_url,
+            page_name=page_name,
+            section_limit=body.section_limit,
+            exclude_sections=body.exclude_sections,
+            shopify_password=body.shopify_password,
+            include_typography=body.include_typography,
+        )
+        logger.info(
+            f"Visual QA job started — id={job_id}, page={page_name}, "
+            f"section_limit={body.section_limit}, exclude={body.exclude_sections}, "
+            f"include_typography={body.include_typography}"
+        )
+    else:
+        background_tasks.add_task(
+            run_visual_qa,
+            job_id=job_id,
+            shopify_url=body.shopify_url,
+            figma_url=body.figma_url,
+            pages=body.pages,
+            shopify_password=body.shopify_password,
+            diff_threshold=body.diff_threshold,
+            exclude_sections=body.exclude_sections,
+        )
+        logger.info(f"Visual QA job started — id={job_id}, pages={body.pages}")
 
-    logger.info(f"Visual QA job started — id={job_id}, pages={body.pages}")
     return {"job_id": job_id, "status": "pending", "message": "Job started. Poll /visual-qa/{job_id} for results."}
 
 

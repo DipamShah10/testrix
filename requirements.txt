@@ -6,8 +6,13 @@ langchain
 langchain-community
 faiss-cpu
 sentence-transformers
+numpy
 slowapi
 pymongo
 playwright
 Pillow
 httpx
+
+# Testing
+pytest
+pytest-asyncio

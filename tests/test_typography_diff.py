@@ -1,0 +1,179 @@
+"""Tests for services/typography_diff.py."""
+from services.typography_diff import (
+    _normalize_family,
+    _parse_css_color,
+    _color_distance,
+    match_text_nodes,
+    compare_typography,
+)
+
+
+def _figma_node(text, x=0, y=0, w=200, h=30, font_family="Inter", font_weight=600,
+                 font_size=16, color=(36, 28, 24), name=""):
+    return {
+        "name": name, "text": text, "x": x, "y": y, "width": w, "height": h,
+        "font_family": font_family, "font_weight": font_weight,
+        "font_size": font_size, "color": color,
+    }
+
+
+def _live_node(text, x=0, y=0, w=200, h=30, font_family="Inter", font_weight=600,
+               font_size=16, color=(36, 28, 24)):
+    return {
+        "text": text, "x": x, "y": y, "width": w, "height": h,
+        "font_family": font_family, "font_weight": font_weight,
+        "font_size": font_size, "color": f"rgb({color[0]}, {color[1]}, {color[2]})",
+    }
+
+
+class TestNormalizeFamily:
+    def test_strips_weight_suffix(self):
+        assert _normalize_family("Inter Bold") == "inter"
+        assert _normalize_family("Inter SemiBold") == "inter"
+
+    def test_strips_css_fallback_stack(self):
+        assert _normalize_family('"Inter", sans-serif') == "inter"
+
+    def test_none_returns_empty(self):
+        assert _normalize_family(None) == ""
+
+    def test_case_insensitive(self):
+        assert _normalize_family("INTER") == _normalize_family("inter regular")
+
+    def test_strips_hyphenated_weight_suffix(self):
+        # Custom webfonts commonly bake weight into the family name with a
+        # hyphen (e.g. self-hosted @font-face families) rather than a space.
+        assert _normalize_family("Raw-Bold") == "raw"
+        assert _normalize_family("Quasimoda-Medium") == "quasimoda"
+        assert _normalize_family("Quasimoda-Medium, sans-serif") == "quasimoda"
+
+
+class TestParseCssColor:
+    def test_parses_rgb(self):
+        assert _parse_css_color("rgb(36, 28, 24)") == (36, 28, 24)
+
+    def test_parses_rgba(self):
+        assert _parse_css_color("rgba(36, 28, 24, 0.5)") == (36, 28, 24)
+
+    def test_invalid_returns_none(self):
+        assert _parse_css_color("transparent") is None
+        assert _parse_css_color(None) is None
+
+
+class TestColorDistance:
+    def test_identical_is_zero(self):
+        assert _color_distance((10, 10, 10), (10, 10, 10)) == 0
+
+    def test_far_colors_large_distance(self):
+        assert _color_distance((0, 0, 0), (255, 255, 255)) > 400
+
+
+class TestMatchTextNodes:
+    def test_matches_by_text_similarity(self):
+        figma = [_figma_node("Sign up to our studio", x=100, y=200)]
+        live = [_live_node("Sign up to our studio", x=105, y=202)]
+        pairs = match_text_nodes(figma, live)
+        assert len(pairs) == 1
+        assert pairs[0][0]["text"] == "Sign up to our studio"
+
+    def test_no_match_below_similarity_threshold(self):
+        figma = [_figma_node("Shop the new collection")]
+        live = [_live_node("Contact our support team")]
+        assert match_text_nodes(figma, live) == []
+
+    def test_distant_identical_text_still_matches(self):
+        # Exact text match should win even far apart (e.g. repeated nav item)
+        figma = [_figma_node("Shop Now", x=50, y=50)]
+        live = [_live_node("Shop Now", x=900, y=3000)]
+        pairs = match_text_nodes(figma, live)
+        assert len(pairs) == 1
+
+    def test_each_node_used_at_most_once(self):
+        figma = [_figma_node("Shop Now", x=0, y=0), _figma_node("Shop Now", x=0, y=500)]
+        live = [_live_node("Shop Now", x=0, y=0)]
+        pairs = match_text_nodes(figma, live)
+        assert len(pairs) == 1
+
+    def test_empty_inputs(self):
+        assert match_text_nodes([], []) == []
+        assert match_text_nodes([_figma_node("x")], []) == []
+        assert match_text_nodes([], [_live_node("x")]) == []
+
+
+class TestCompareTypography:
+    def test_identical_styles_produce_no_issues(self):
+        figma = [_figma_node("Menu Item", name="Menu Item")]
+        live = [_live_node("Menu Item")]
+        assert compare_typography(figma, live) == []
+
+    def test_font_weight_mismatch_detected(self):
+        figma = [_figma_node("Menu Item", font_weight=600, name="Menu Item")]
+        live = [_live_node("Menu Item", font_weight=400)]
+        issues = compare_typography(figma, live)
+        assert len(issues) == 1
+        fields = [m["field"] for m in issues[0]["typography_mismatches"]]
+        assert "font weight" in fields
+        assert "600" in issues[0]["typography_mismatches"][0]["figma"]
+        assert issues[0]["issue_type"] == "typography"
+
+    def test_font_size_mismatch_detected(self):
+        figma = [_figma_node("Body copy", font_size=16)]
+        live = [_live_node("Body copy", font_size=13)]
+        issues = compare_typography(figma, live)
+        assert len(issues) == 1
+        assert issues[0]["typography_mismatches"][0]["field"] == "font size"
+
+    def test_small_size_difference_is_ignored(self):
+        # Sub-pixel rounding noise should not trigger a false positive
+        figma = [_figma_node("Body copy", font_size=16.0)]
+        live = [_live_node("Body copy", font_size=16.9)]
+        assert compare_typography(figma, live) == []
+
+    def test_color_mismatch_detected(self):
+        figma = [_figma_node("Copyright", color=(20, 20, 20))]
+        live = [_live_node("Copyright", color=(180, 180, 180))]
+        issues = compare_typography(figma, live)
+        assert len(issues) == 1
+        assert issues[0]["typography_mismatches"][0]["field"] == "color"
+
+    def test_multiple_mismatches_all_reported(self):
+        figma = [_figma_node("Heading", font_weight=700, font_size=32, color=(0, 0, 0))]
+        live = [_live_node("Heading", font_weight=400, font_size=24, color=(120, 120, 120))]
+        issues = compare_typography(figma, live)
+        assert len(issues) == 1
+        fields = {m["field"] for m in issues[0]["typography_mismatches"]}
+        assert fields == {"font weight", "font size", "color"}
+        # Severity signal should scale with number of mismatches
+        assert issues[0]["diff_percent"] == 60.0
+
+    def test_font_family_alias_not_flagged(self):
+        # "Inter Bold" (Figma naming) vs "Inter" (live) should NOT be a family mismatch
+        figma = [_figma_node("Title", font_family="Inter Bold")]
+        live = [_live_node("Title", font_family="Inter")]
+        assert compare_typography(figma, live) == []
+
+    def test_hyphenated_webfont_alias_not_flagged(self):
+        # Regression: self-hosted webfont families are often named
+        # "Quasimoda-Medium" in live CSS vs base "Quasimoda" + weight in Figma.
+        figma = [_figma_node("Shop Now", font_family="Quasimoda", font_weight=500)]
+        live = [_live_node("Shop Now", font_family="Quasimoda-Medium", font_weight=500)]
+        assert compare_typography(figma, live) == []
+
+    def test_font_family_real_mismatch_detected(self):
+        figma = [_figma_node("Title", font_family="Inter")]
+        live = [_live_node("Title", font_family="Arial")]
+        issues = compare_typography(figma, live)
+        assert len(issues) == 1
+        assert issues[0]["typography_mismatches"][0]["field"] == "font family"
+
+    def test_issue_carries_region_coords_from_live_node(self):
+        figma = [_figma_node("Title", x=10, y=10, font_size=20)]
+        live = [_live_node("Title", x=15, y=12, w=180, h=28, font_size=14)]
+        issues = compare_typography(figma, live)
+        assert issues[0]["x"] == 15
+        assert issues[0]["y"] == 12
+        assert issues[0]["width"] == 180
+        assert issues[0]["height"] == 28
+
+    def test_empty_inputs_produce_no_issues(self):
+        assert compare_typography([], []) == []

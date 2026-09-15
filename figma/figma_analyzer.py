@@ -16,15 +16,22 @@ class FigmaAnalyzer:
         file_key, node_id = self._parse_url(figma_url)
         headers = {"X-Figma-Token": self.figma_token}
 
-        async def load_file() -> dict:
+        async def load_document() -> dict:
             async with httpx.AsyncClient(
                 timeout=httpx.Timeout(connect=10, read=60, write=10, pool=10)
             ) as client:
-                resp = await client.get(
-                    f"https://api.figma.com/v1/files/{file_key}",
-                    headers=headers,
-                    params={"depth": 3},
-                )
+                if node_id:
+                    resp = await client.get(
+                        f"https://api.figma.com/v1/files/{file_key}/nodes",
+                        headers=headers,
+                        params={"ids": node_id},
+                    )
+                else:
+                    resp = await client.get(
+                        f"https://api.figma.com/v1/files/{file_key}",
+                        headers=headers,
+                        params={"depth": 4},
+                    )
                 if resp.status_code == 401:
                     raise ValueError("Figma 401 — FIGMA_API_TOKEN is invalid or expired.")
                 if resp.status_code == 403:
@@ -32,8 +39,14 @@ class FigmaAnalyzer:
                 resp.raise_for_status()
                 return resp.json()
 
-        payload = await with_retry(load_file, retries=5, base_delay=15.0)
-        target_nodes = self._collect_nodes(payload.get("document", {}), node_id)
+        payload = await with_retry(load_document, retries=5, base_delay=15.0)
+        if node_id:
+            nodes_payload = payload.get("nodes", {})
+            entry = nodes_payload.get(node_id) or next(iter(nodes_payload.values()), {})
+            root = entry.get("document", {})
+        else:
+            root = payload.get("document", {})
+        target_nodes = self._collect_nodes(root)
 
         return FigmaBaseline(
             source_url=figma_url,
@@ -59,17 +72,16 @@ class FigmaAnalyzer:
         raw_node_id = parse_qs(parsed.query).get("node-id", [None])[0]
         return file_key, raw_node_id.replace("-", ":") if raw_node_id else None
 
-    def _collect_nodes(self, root: dict, target_node_id: str | None) -> list[dict]:
+    def _collect_nodes(self, root: dict) -> list[dict]:
         nodes: list[dict] = []
 
         def walk(node: dict) -> None:
-            node_id = node.get("id", "")
-            if not target_node_id or target_node_id == node_id or target_node_id == node_id.replace("-", ":"):
-                nodes.append(node)
+            nodes.append(node)
             for child in node.get("children", []):
                 walk(child)
 
-        walk(root)
+        if root:
+            walk(root)
         return nodes
 
     def _extract_color(self, node: dict) -> str:

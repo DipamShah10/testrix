@@ -13,6 +13,7 @@ _FIGMA_API = "https://api.figma.com/v1"
 # ── Retry / backoff ──────────────────────────────────────────────────────────
 _MAX_RETRIES = 5
 _RETRY_BASE_S = 15          # first retry waits 15s, then 30s, 60s, 120s, 240s
+_MAX_RETRY_WAIT_S = 120     # cap on any single wait — Figma's own Retry-After can be absurdly long
 _EXPORT_BATCH_SIZE = 5      # max node IDs per /images request — avoids 400 on large files
 
 # ── Cache ────────────────────────────────────────────────────────────────────
@@ -173,6 +174,11 @@ async def _api_get(path: str, headers: dict, **kwargs) -> httpx.Response:
                 if retry_after and retry_after.isdigit()
                 else _RETRY_BASE_S * (2 ** attempt)
             )
+            if wait > _MAX_RETRY_WAIT_S:
+                logger.warning(
+                    f"Figma Retry-After={wait}s exceeds cap — clamping to {_MAX_RETRY_WAIT_S}s"
+                )
+                wait = _MAX_RETRY_WAIT_S
             logger.warning(
                 f"Figma 429 — path={path}, attempt={attempt + 1}/{_MAX_RETRIES}, "
                 f"retry_in={wait}s, elapsed={elapsed:.2f}s"
@@ -290,7 +296,7 @@ async def extract_frames(figma_url: str) -> tuple[list[dict], dict]:
 # Internal fetch — called only through extract_frames
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def _fetch_frames(token: str, file_key: str, node_id: str | None) -> list[dict]:
+async def _fetch_frames(token: str, file_key: str, node_id: str | None) -> tuple[list[dict], dict]:
     """Hit the Figma API and download frame PNGs. No caching — use extract_frames."""
     headers = {"X-Figma-Token": token}
 
@@ -306,6 +312,28 @@ async def _fetch_frames(token: str, file_key: str, node_id: str | None) -> list[
             "Make sure the URL points to a file with top-level frames."
         )
     logger.info(f"Figma frames found — {len(frames)}: {[f['name'] for f in frames]}")
+
+    # The depth=3 fetch above is only deep enough to *locate* each frame — its
+    # own children are frequently truncated by that same depth cap, which is
+    # why `sections` (and text/image/button content) can come back empty or
+    # truncated for any frame with real nesting. Re-fetch each frame's full
+    # (uncapped) subtree via /nodes ONCE, and derive sections, text nodes,
+    # image nodes, and button nodes all from that single fetched document —
+    # previously this same subtree was fetched twice (once here, once again
+    # inside the old _fetch_frame_text_nodes), doubling Figma API usage for
+    # no reason.
+    for frame in frames:
+        full_doc = None
+        try:
+            full_doc = await _fetch_frame_full_node(token, file_key, frame["node_id"])
+        except Exception as exc:
+            logger.warning(
+                f"Full-depth fetch failed for frame '{frame['name']}' "
+                f"({frame['node_id']}): {exc} — keeping depth-limited data"
+            )
+        frame["_full_doc"] = full_doc
+        if full_doc:
+            frame["sections"] = _extract_frame_sections(full_doc)
 
     # Step 2: export PNG URLs (batched to avoid 400 from URL-length limits)
     logger.info(f"Figma export request — {len(frames)} frame(s) at @2x PNG")
@@ -323,7 +351,10 @@ async def _fetch_frames(token: str, file_key: str, node_id: str | None) -> list[
             raise RuntimeError(f"Figma image export error: {img_data['err']}")
         image_urls.update(img_data.get("images", {}))
 
-    # Step 3: download each PNG from CDN
+    # Step 3: download each PNG from CDN + fetch full-depth text nodes per frame.
+    # depth=3 above is enough for sections, but text runs are often nested 3+
+    # levels inside a frame (Frame > Group > Group > Text) and get truncated —
+    # so each frame's text specs are fetched separately via /nodes (no depth cap).
     results = []
     for frame in frames:
         nid = frame["node_id"]
@@ -332,12 +363,26 @@ async def _fetch_frames(token: str, file_key: str, node_id: str | None) -> list[
             logger.warning(f"No CDN URL for frame '{frame['name']}' ({nid}) — skipping")
             continue
         image_bytes = await _download_png(img_url, frame["name"])
+
+        full_doc = frame.get("_full_doc")
+        text_nodes = _extract_text_nodes(full_doc) if full_doc else []
+        image_nodes = _extract_image_nodes(full_doc) if full_doc else []
+        button_nodes = _extract_button_nodes(full_doc) if full_doc else []
+        logger.info(
+            f"Figma elements — frame={nid}, text={len(text_nodes)}, "
+            f"images={len(image_nodes)}, buttons={len(button_nodes)}"
+        )
+
         results.append({
-            "name": frame["name"],
-            "node_id": nid,
-            "image_bytes": image_bytes,
-            "width": frame.get("width"),
-            "height": frame.get("height"),
+            "name":         frame["name"],
+            "node_id":      nid,
+            "image_bytes":  image_bytes,
+            "width":        frame.get("width"),
+            "height":       frame.get("height"),
+            "sections":     frame.get("sections", []),
+            "text_nodes":   text_nodes,
+            "image_nodes":  image_nodes,
+            "button_nodes": button_nodes,
         })
 
     typography = _collect_typography(file_data)
@@ -349,11 +394,313 @@ async def _fetch_frames(token: str, file_key: str, node_id: str | None) -> list[
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Per-frame text node fetch — full depth, no truncation
+# ─────────────────────────────────────────────────────────────────────────────
+
+_MAX_TEXT_NODES_PER_FRAME = 200   # cap to keep matching/comparison cost bounded
+
+
+async def _fetch_frame_full_node(token: str, file_key: str, node_id: str) -> dict | None:
+    """
+    Fetch one frame's full (untruncated) document subtree via /files/{key}/nodes.
+    Unlike the depth-limited /files call used for frame discovery, this reaches
+    every descendant regardless of nesting depth — needed for section extraction
+    on frames whose real content sits deeper than the discovery depth cap.
+    """
+    headers = {"X-Figma-Token": token}
+    resp = await _api_get(f"/files/{file_key}/nodes", headers, params={"ids": node_id})
+    data = resp.json()
+    entry = data.get("nodes", {}).get(node_id)
+    return entry.get("document") if entry else None
+
+
+# A short/icon-like text node (a lone "!", a single glyph in a badge) has a
+# tight glyph-only bounding box that's much smaller than the padded visual
+# container it actually sits inside (a callout, a chip, a labeled icon). Using
+# that tight box as the neighbor-search anchor for spacing measurements
+# measures from the wrong edge — the padding inside the container reads as
+# part of the "gap" to whatever's next to it, wildly inflating the number.
+# Confirmed against a real case: a "!" glyph (26px tall) inside a 66px-tall
+# icon+message row — spacing measured from the glyph's own box overstated the
+# real gap by exactly the container's extra padding.
+#
+# _CONTAINER_PAD_MIN_PX / _MAX_PX bound how much taller the immediate parent
+# must be to count as "this text's padded container" rather than an unrelated
+# larger layout wrapper: some padding is expected (min), but a huge jump (past
+# max) means the parent is a whole section, not a snug wrapper around this text.
+_CONTAINER_PAD_MIN_PX = 4
+_CONTAINER_PAD_MAX_PX = 150
+
+# A parent only qualifies as a text node's padded "spacing box" if its OTHER
+# text children sit on roughly the same visual row (an icon glyph next to a
+# one-line label) — not stacked below/above it (a heading with its own body
+# paragraph inside one bordered callout). Confirmed as a real regression: a
+# heading + paragraph sharing one bordered "note" box both have modest height
+# padding individually, but treating the whole box as the HEADING's own
+# spacing box silently absorbed the paragraph's space into the heading's
+# effective bottom edge — corrupting every gap measured against that heading.
+# A same-row icon+label pair has near-identical child y (within a few px of
+# line-height/baseline variance); stacked content differs by tens of px.
+_SAME_ROW_Y_TOLERANCE_PX = 20
+
+
+def _extract_text_nodes(frame_doc: dict) -> list[dict]:
+    """
+    Collect every TEXT node's spec from an already-fetched full-depth frame
+    document: text content, position (frame-relative), and style (font
+    family/weight/size/color). Pure function — no API call, so it can be
+    reused for section/image/button extraction off the same fetched tree
+    instead of each needing its own /nodes round-trip.
+    """
+    bb = frame_doc.get("absoluteBoundingBox") or {}
+    frame_x = bb.get("x", 0) or 0
+    frame_y = bb.get("y", 0) or 0
+
+    nodes: list[dict] = []
+
+    def walk(node: dict, parent: dict | None) -> None:
+        if len(nodes) >= _MAX_TEXT_NODES_PER_FRAME:
+            return
+        # An invisible node's children are invisible too, even if a child's own
+        # "visible" flag is individually true (Figma doesn't rewrite descendant
+        # flags when a parent is hidden) — e.g. a hidden/duplicate component
+        # variant left in the tree. Skipping the whole subtree here, not just
+        # the node itself, stops these ghost nodes from being picked as a real
+        # spacing/typography neighbor.
+        if node.get("visible", True) is False:
+            return
+        if node.get("type") == "TEXT":
+            text = (node.get("characters") or "").strip()
+            if text:
+                node_bb = node.get("absoluteBoundingBox") or {}
+                style = node.get("style", {}) or {}
+                own_y = node_bb.get("y", 0) or 0
+                own_height = node_bb.get("height", 0) or 0
+                own_width = node_bb.get("width", 0) or 0
+
+                color = None
+                for fill in node.get("fills", []) or []:
+                    if fill.get("visible", True) is False:
+                        continue
+                    c = fill.get("color")
+                    if c:
+                        color = (
+                            round(c.get("r", 0) * 255),
+                            round(c.get("g", 0) * 255),
+                            round(c.get("b", 0) * 255),
+                        )
+                        break
+
+                entry = {
+                    "name":        node.get("name", ""),
+                    "text":        text[:120],
+                    "x":           max(0, round((node_bb.get("x", 0) or 0) - frame_x)),
+                    "y":           max(0, round(own_y - frame_y)),
+                    "width":       round(own_width),
+                    "height":      round(own_height),
+                    "font_family": style.get("fontFamily"),
+                    "font_weight": style.get("fontWeight"),
+                    "font_size":   style.get("fontSize"),
+                    "color":       color,
+                }
+
+                parent_bb = parent.get("absoluteBoundingBox") if parent else None
+                if parent_bb:
+                    pad = (parent_bb.get("height", 0) or 0) - own_height
+                    same_row = all(
+                        abs((sib.get("absoluteBoundingBox", {}).get("y", 0) or 0) - own_y)
+                        <= _SAME_ROW_Y_TOLERANCE_PX
+                        for sib in parent.get("children", []) or []
+                        if sib is not node and sib.get("type") == "TEXT"
+                        and (sib.get("characters") or "").strip()
+                        and sib.get("visible", True) is not False
+                    )
+                    if _CONTAINER_PAD_MIN_PX < pad <= _CONTAINER_PAD_MAX_PX \
+                            and (parent_bb.get("width", 0) or 0) >= own_width \
+                            and same_row:
+                        entry["spacing_box"] = {
+                            "x":      max(0, round((parent_bb.get("x", 0) or 0) - frame_x)),
+                            "y":      max(0, round((parent_bb.get("y", 0) or 0) - frame_y)),
+                            "width":  round(parent_bb.get("width", 0) or 0),
+                            "height": round(parent_bb.get("height", 0) or 0),
+                        }
+
+                nodes.append(entry)
+        for child in node.get("children", []) or []:
+            walk(child, node)
+
+    walk(frame_doc, None)
+    return nodes
+
+
+_MAX_IMAGE_NODES_PER_FRAME = 200
+
+
+def _extract_image_nodes(frame_doc: dict) -> list[dict]:
+    """
+    Collect every node with a visible IMAGE fill from an already-fetched
+    full-depth frame document — Figma's equivalent of a live-page <img>.
+    """
+    bb = frame_doc.get("absoluteBoundingBox") or {}
+    frame_x = bb.get("x", 0) or 0
+    frame_y = bb.get("y", 0) or 0
+
+    nodes: list[dict] = []
+
+    def walk(node: dict) -> None:
+        if len(nodes) >= _MAX_IMAGE_NODES_PER_FRAME:
+            return
+        # Skip the whole subtree under an invisible node — a hidden ancestor
+        # makes every descendant invisible too, regardless of each child's own
+        # "visible" flag (see the matching note in _extract_text_nodes).
+        if node.get("visible", True) is False:
+            return
+
+        fills = node.get("fills") or []
+        has_image_fill = any(
+            f.get("type") == "IMAGE" and f.get("visible", True) is not False
+            for f in fills
+        )
+        if has_image_fill:
+            node_bb = node.get("absoluteBoundingBox") or {}
+            w = round(node_bb.get("width", 0) or 0)
+            h = round(node_bb.get("height", 0) or 0)
+            if w > 4 and h > 4:
+                nodes.append({
+                    "name":   node.get("name", ""),
+                    # Common matching key with live image_elements — a live
+                    # <img>'s alt text is often empty, so its own label
+                    # falls back to its filename; Figma's layer name is the
+                    # closest equivalent on that side.
+                    "label":  node.get("name", ""),
+                    "x":      max(0, round((node_bb.get("x", 0) or 0) - frame_x)),
+                    "y":      max(0, round((node_bb.get("y", 0) or 0) - frame_y)),
+                    "width":  w,
+                    "height": h,
+                })
+        for child in node.get("children", []) or []:
+            walk(child)
+
+    walk(frame_doc)
+    return nodes
+
+
+# Heuristics for recognizing a "button" in Figma — there's no semantic button
+# node type, so a button is inferred as a small, contained, filled/stroked
+# frame-like node wrapping a short text label. Necessarily approximate.
+_BUTTON_TEXT_MAX_LEN = 40
+_BUTTON_MAX_TEXT_DESCENDANTS = 2
+_BUTTON_MIN_W, _BUTTON_MAX_W = 40, 420
+_BUTTON_MIN_H, _BUTTON_MAX_H = 22, 90
+_MAX_BUTTON_NODES_PER_FRAME = 100
+
+
+def _collect_text_descendants(node: dict, acc: list[dict]) -> None:
+    if node.get("visible", True) is False:
+        return
+    if node.get("type") == "TEXT":
+        if (node.get("characters") or "").strip():
+            acc.append(node)
+        return
+    for child in node.get("children", []) or []:
+        _collect_text_descendants(child, acc)
+
+
+def _extract_button_nodes(frame_doc: dict) -> list[dict]:
+    """
+    Collect nodes that look like buttons: a FRAME/COMPONENT/INSTANCE/GROUP,
+    button-shaped in size, with a visible fill or stroke, wrapping one short
+    text label (its visible caption). Necessarily heuristic — Figma has no
+    dedicated "button" node type.
+    """
+    bb = frame_doc.get("absoluteBoundingBox") or {}
+    frame_x = bb.get("x", 0) or 0
+    frame_y = bb.get("y", 0) or 0
+
+    nodes: list[dict] = []
+
+    def walk(node: dict) -> None:
+        if len(nodes) >= _MAX_BUTTON_NODES_PER_FRAME:
+            return
+        if node.get("visible", True) is False:
+            return
+
+        ntype = node.get("type", "")
+        if ntype in ("FRAME", "COMPONENT", "INSTANCE", "GROUP"):
+            node_bb = node.get("absoluteBoundingBox") or {}
+            w = node_bb.get("width", 0) or 0
+            h = node_bb.get("height", 0) or 0
+            is_button_shaped = (
+                _BUTTON_MIN_W <= w <= _BUTTON_MAX_W and _BUTTON_MIN_H <= h <= _BUTTON_MAX_H
+            )
+            has_fill = any(f.get("visible", True) is not False for f in (node.get("fills") or []))
+            has_stroke = bool(node.get("strokes"))
+
+            if is_button_shaped and (has_fill or has_stroke):
+                text_descendants: list[dict] = []
+                _collect_text_descendants(node, text_descendants)
+                label = " ".join(t.get("characters", "").strip() for t in text_descendants).strip()
+
+                if 0 < len(text_descendants) <= _BUTTON_MAX_TEXT_DESCENDANTS \
+                        and 0 < len(label) <= _BUTTON_TEXT_MAX_LEN:
+                    nodes.append({
+                        "name":   node.get("name", ""),
+                        "label":  label,
+                        "x":      max(0, round((node_bb.get("x", 0) or 0) - frame_x)),
+                        "y":      max(0, round((node_bb.get("y", 0) or 0) - frame_y)),
+                        "width":  round(w),
+                        "height": round(h),
+                    })
+                    return  # matched as a button — don't also descend into its children
+
+        for child in node.get("children", []) or []:
+            walk(child)
+
+    walk(frame_doc)
+    return nodes
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Frame tree walker
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _extract_frame_sections(frame_node: dict) -> list[dict]:
+    """
+    Return direct children of a Figma frame as section descriptors.
+    Coordinates are relative to the frame's own top-left corner.
+    Only children with meaningful dimensions are included.
+    """
+    bb = frame_node.get("absoluteBoundingBox", {})
+    frame_x = bb.get("x", 0) or 0
+    frame_y = bb.get("y", 0) or 0
+
+    sections = []
+    for child in frame_node.get("children", []):
+        if child.get("visible", True) is False:
+            continue
+        child_bb = child.get("absoluteBoundingBox", {})
+        cw = int(child_bb.get("width",  0) or 0)
+        ch = int(child_bb.get("height", 0) or 0)
+        cx = child_bb.get("x", 0) or 0
+        cy = child_bb.get("y", 0) or 0
+
+        if cw < 100 or ch < 80:
+            continue
+
+        sections.append({
+            "name":   child.get("name", ""),
+            "type":   child.get("type", ""),
+            "rel_x":  max(0, int(cx - frame_x)),
+            "rel_y":  max(0, int(cy - frame_y)),
+            "width":  cw,
+            "height": ch,
+        })
+
+    return sections
+
+
 def _collect_frames(file_data: dict, target_node_id: str | None) -> list[dict]:
-    """Walk the Figma document tree and collect frame nodes."""
+    """Walk the Figma document tree and collect frame nodes with their section children."""
     frames = []
     document = file_data.get("document", {})
 
@@ -368,10 +715,16 @@ def _collect_frames(file_data: dict, target_node_id: str | None) -> list[dict]:
         if node_type in ("FRAME", "COMPONENT", "SECTION"):
             if target_node_id:
                 if node_id == target_node_id or node_id.replace("-", ":") == target_node_id:
-                    frames.append({"name": name, "node_id": node_id, "width": w, "height": h})
+                    frames.append({
+                        "name": name, "node_id": node_id, "width": w, "height": h,
+                        "sections": _extract_frame_sections(node),
+                    })
                     return
             else:
-                frames.append({"name": name, "node_id": node_id, "width": w, "height": h})
+                frames.append({
+                    "name": name, "node_id": node_id, "width": w, "height": h,
+                    "sections": _extract_frame_sections(node),
+                })
                 return
 
         for child in node.get("children", []):

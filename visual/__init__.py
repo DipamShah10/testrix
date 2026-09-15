@@ -1,0 +1,1 @@
+# Visual capture and alignment utilities
