@@ -11,6 +11,9 @@ import logging
 import re
 from difflib import SequenceMatcher
 
+import numpy as np
+from scipy.optimize import linear_sum_assignment
+
 from visual.section_alignment_engine import _detect_type  # noqa: F401 — re-exported for callers
 
 logger = logging.getLogger(__name__)
@@ -140,45 +143,55 @@ def match_sections(
     min_confidence: float = 25.0,
 ) -> list[tuple[dict, dict, float]]:
     """
-    Greedy best-match pairing of Figma sections → live DOM sections.
+    Optimal (Hungarian-algorithm) pairing of Figma sections -> live DOM
+    sections — replaces a previous greedy implementation that processed
+    Figma sections in order and committed irrevocably on each pick. On a
+    page with several near-identical repeating sections (the type/text
+    signals in _score_pair degenerate to noise across them), greedy's
+    first-come-first-served commitment had no way to reconsider an early
+    wrong pick, cascading misalignment down the rest of the list — this is
+    the documented "greedy matching can misalign sections on pages with many
+    similar-looking containers" limitation. Optimal assignment instead picks
+    the pairing that maximizes the SUM of scores across all pairs at once:
+    for a row of positionally-ordered repeating sections, the order-
+    preserving assignment maximizes the 20-pt positional term far more than
+    any crossed assignment does, so it naturally wins even when the 40+40
+    type/text terms are tied/degenerate across the row.
 
     Returns [(figma_sec, live_sec, confidence), ...] where confidence is 0–100.
-    Only pairs scoring above min_confidence are returned.
-    Live sections without a screenshot are still matched but flagged.
+    Only pairs scoring above min_confidence are returned — Hungarian is
+    forced to assign every row when n_figma <= n_live, so this threshold
+    filter (identical to the old greedy behavior) is still what prevents a
+    genuinely bad pair from surviving into the result.
     """
     if not figma_sections or not live_sections:
         return []
 
     n_figma = len(figma_sections)
     n_live  = len(live_sections)
-    used_live: set[int] = set()
-    pairs: list[tuple[dict, dict, float]] = []
 
+    cost = np.empty((n_figma, n_live), dtype=float)
     for fi, fsec in enumerate(figma_sections):
-        best_idx   = -1
-        best_score = -1.0
-
         for li, lsec in enumerate(live_sections):
-            if li in used_live:
-                continue
-            sc = _score_pair(fsec, lsec, fi, li, n_figma, n_live)
-            if sc > best_score:
-                best_score = sc
-                best_idx   = li
+            cost[fi, li] = -_score_pair(fsec, lsec, fi, li, n_figma, n_live)
 
-        if best_idx >= 0 and best_score >= min_confidence:
-            used_live.add(best_idx)
-            conf = round(best_score, 1)
-            pairs.append((fsec, live_sections[best_idx], conf))
+    figma_idx, live_idx = linear_sum_assignment(cost)
+
+    pairs: list[tuple[dict, dict, float]] = []
+    for fi, li in zip(figma_idx, live_idx):
+        score = -cost[fi, li]
+        if score >= min_confidence:
+            conf = round(score, 1)
+            pairs.append((figma_sections[fi], live_sections[li], conf))
             logger.debug(
-                f"Section match — Figma '{fsec.get('name', '?')}' "
-                f"→ live '{_live_label(live_sections[best_idx])[:40]}' "
+                f"Section match — Figma '{figma_sections[fi].get('name', '?')}' "
+                f"→ live '{_live_label(live_sections[li])[:40]}' "
                 f"(conf={conf})"
             )
         else:
             logger.debug(
-                f"Section unmatched — Figma '{fsec.get('name', '?')}' "
-                f"(best_score={best_score:.1f} < {min_confidence})"
+                f"Section unmatched — Figma '{figma_sections[fi].get('name', '?')}' "
+                f"(best_score={score:.1f} < {min_confidence})"
             )
 
     logger.info(
@@ -186,3 +199,17 @@ def match_sections(
         f"→ {len(pairs)} pairs matched"
     )
     return pairs
+
+
+def unmatched_figma_sections(
+    figma_sections: list[dict],
+    pairs: list[tuple[dict, dict, float]],
+) -> list[dict]:
+    """
+    Figma sections that match_sections did not pair with any live section
+    (below min_confidence, or n_live < n_figma) — a caller can surface these
+    as "needs_recheck" (a Figma section that may not exist on the live page,
+    or couldn't be confidently located) instead of silently dropping them.
+    """
+    matched_ids = {id(fsec) for fsec, _, _ in pairs}
+    return [fsec for fsec in figma_sections if id(fsec) not in matched_ids]

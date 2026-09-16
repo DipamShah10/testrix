@@ -108,6 +108,15 @@ async def classify_issue(issue: dict) -> dict:
         issue["severity"] = "Low"
         issue["rule_severity"] = "Low"
         return issue
+    # A finding whose underlying Figma<->live pairing itself was low-
+    # confidence (e.g. analyze_section_pairs's content-consistency gate, or
+    # an unmatched Figma section from the optimal section matcher) — surface
+    # it for manual review rather than let keyword rules or diff_percent
+    # push an unverified pairing straight to Critical/High.
+    if issue_type == "needs_recheck":
+        issue["severity"] = "Medium"
+        issue["rule_severity"] = "Medium"
+        return issue
 
     # Typography issues from typography_diff carry a real magnitude score
     # (computed from actual font-family/size/weight/color deltas) — use that

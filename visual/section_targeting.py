@@ -26,8 +26,15 @@ from visual.section_alignment_engine import _detect_type, _section_label
 logger = logging.getLogger(__name__)
 
 # Below this word/char-similarity score, treat it as "no confident match"
-# rather than silently picking the least-bad candidate.
-_MIN_MATCH_SCORE = 0.15
+# rather than silently picking the least-bad candidate. Split into two
+# constants: live-side DOM headings tend to be fairly unique per section, so
+# the original permissive floor is kept there; the Figma-side anchor search
+# needs a stricter floor — on a page with several near-identical repeating
+# cards sharing boilerplate phrasing, 0.15 was loose enough to lock onto a
+# text node from an entirely different card (confirmed root cause of a real
+# false positive).
+_MIN_LIVE_MATCH_SCORE = 0.15
+_MIN_FIGMA_ANCHOR_SCORE = 0.35
 
 
 def select_first_n_sections(
@@ -68,7 +75,7 @@ def find_live_section(query: str, dom_sections: list[dict]) -> dict | None:
         if score > best_score:
             best, best_score = sec, score
 
-    if best is None or best_score < _MIN_MATCH_SCORE:
+    if best is None or best_score < _MIN_LIVE_MATCH_SCORE:
         logger.info(f"No confident live-section match for {query!r} (best={best_score:.2f})")
         return None
 
@@ -79,21 +86,57 @@ def find_live_section(query: str, dom_sections: list[dict]) -> dict | None:
     return best
 
 
-def find_figma_anchor_node(query: str, figma_text_nodes: list[dict]) -> dict | None:
+def find_figma_anchor_node(
+    query: str,
+    figma_text_nodes: list[dict],
+    expected_y: float | None = None,
+    search_radius: float | None = None,
+    used_indices: set[int] | None = None,
+) -> tuple[dict, int] | None:
     """
     Best-matching Figma TEXT node for the query — used to locate a section's
     approximate position when the Figma frame has no separately-named
     sub-layer for it.
-    """
-    best, best_score = None, 0.0
-    for node in figma_text_nodes:
-        score = _similarity(query, node.get("text", ""))
-        if score > best_score:
-            best, best_score = node, score
 
-    if best is None or best_score < _MIN_MATCH_SCORE:
-        return None
-    return best
+    When expected_y/search_radius are given, searches only the nodes within
+    that vertical window first (skipping any index already in used_indices),
+    only falling back to a full-page search if nothing in the window clears
+    the similarity floor. On a page with several near-identical repeating
+    cards sharing boilerplate phrasing, an unscoped global search can lock
+    onto a text node from a different card purely because it scores
+    marginally higher — preferring a nearby candidate first avoids that.
+
+    used_indices lets a caller exclude nodes already committed as another
+    section's anchor in the same run — without this, two different live
+    sections can independently resolve to the SAME Figma anchor.
+
+    Returns (node, index) so the caller can track which node was used, or
+    None if nothing cleared the floor.
+    """
+    used_indices = used_indices or set()
+
+    def _search(indices) -> tuple[dict, int] | None:
+        best, best_idx, best_score = None, None, 0.0
+        for i in indices:
+            if i in used_indices:
+                continue
+            score = _similarity(query, figma_text_nodes[i].get("text", ""))
+            if score > best_score:
+                best, best_idx, best_score = figma_text_nodes[i], i, score
+        if best is None or best_score < _MIN_FIGMA_ANCHOR_SCORE:
+            return None
+        return best, best_idx
+
+    if expected_y is not None and search_radius is not None:
+        windowed = [
+            i for i, node in enumerate(figma_text_nodes)
+            if abs(node.get("y", 0) - expected_y) <= search_radius
+        ]
+        result = _search(windowed)
+        if result is not None:
+            return result
+
+    return _search(range(len(figma_text_nodes)))
 
 
 def derive_figma_region(
@@ -102,19 +145,42 @@ def derive_figma_region(
     live_page_height: float,
     figma_frame_height: float,
     frame_width: float,
+    used_anchor_indices: set[int] | None = None,
 ) -> dict:
     """
     Derive a Figma region {x, y, width, height} (frame-relative, logical px)
     corresponding to a live DOM section, for frames with no separate named
     sub-layer to crop directly.
+
+    used_anchor_indices: pass a set that's shared/reused across every section
+    in one run (e.g. run_multi_section_qa's per-section loop) so a Figma text
+    node already claimed as an earlier section's anchor can't also become a
+    later section's anchor — mutated in place, so the caller's set
+    accumulates automatically. Without this, two different live sections
+    (e.g. two cards in a repeating "fleet" listing) can independently
+    resolve to the SAME Figma anchor, producing two report entries that
+    quote the same Figma text with reversed, contradictory numbers.
     """
     query = live_section.get("heading") or live_section.get("textSnippet", "")[:60]
-    anchor = find_figma_anchor_node(query, figma_text_nodes)
 
     scale = (figma_frame_height / live_page_height) if live_page_height else 1.0
     height = live_section.get("height", 0) * scale
+    # Used both as the anchor search's positional prior AND the no-anchor
+    # fallback position — the section's own proportional position is a
+    # reasonable "expected" Figma y even before any text match is attempted.
+    expected_y = (live_section.get("y", 0) / live_page_height) * figma_frame_height if live_page_height else 0.0
+    search_radius = max(3 * height, 200)
 
-    if anchor:
+    result = find_figma_anchor_node(
+        query, figma_text_nodes,
+        expected_y=expected_y, search_radius=search_radius,
+        used_indices=used_anchor_indices,
+    )
+
+    if result is not None:
+        anchor, anchor_idx = result
+        if used_anchor_indices is not None:
+            used_anchor_indices.add(anchor_idx)
         # The section itself usually starts a bit above its own heading text
         # (an eyebrow label, vertical padding) — nudge the top up slightly
         # rather than starting exactly at the heading's own top edge.
@@ -125,7 +191,7 @@ def derive_figma_region(
     else:
         # No text anchor found — fall back to the live section's own relative
         # vertical position, scaled onto the Figma frame's height.
-        y = (live_section.get("y", 0) / live_page_height) * figma_frame_height if live_page_height else 0.0
+        y = expected_y
         logger.info("No Figma text anchor found — falling back to proportional position")
 
     return {"x": 0.0, "y": y, "width": frame_width, "height": height}

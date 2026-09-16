@@ -108,6 +108,98 @@ class TestClassifyIssue:
         assert result["severity"] in SEVERITIES
 
 
+class TestClassifyIssueMagnitudeScoreBranch:
+    """
+    Regression coverage for the deterministic magnitude_score branch
+    (severity_classifier.py, typography/dimension/spacing issue types with a
+    'magnitude_score' key) — this is the exact path real typography_diff/
+    geometry_diff-produced issues go through, and it was previously
+    completely untested (the one prior typography test case deliberately
+    omitted magnitude_score, so it exercised the keyword+LLM path instead).
+    This branch is what turns a flat font-family-mismatch magnitude (40.0)
+    into a guaranteed-High-or-above severity with no LLM/confidence check —
+    important to lock down given how easily that magnitude gets triggered by
+    a font-name formatting false positive.
+    """
+
+    @pytest.mark.asyncio
+    async def test_magnitude_40_is_high(self):
+        # "footer" would normally rule-base to "Low" (_LOW_KEYWORDS) — the
+        # magnitude_score branch must take priority and override that.
+        issue = {
+            "element": "footer copyright text",
+            "issue_type": "typography",
+            "description": "font family differs",
+            "user_impact": "", "diff_percent": 20.0,
+            "magnitude_score": 40.0,
+        }
+        with patch("services.severity_classifier.ask_ai") as mock_ai:
+            result = await classify_issue(issue)
+        mock_ai.assert_not_called()
+        assert result["severity"] == "High"
+        assert result["rule_severity"] == "High"
+
+    @pytest.mark.asyncio
+    async def test_magnitude_50_is_critical(self):
+        issue = {
+            "element": "body paragraph", "issue_type": "typography",
+            "description": "", "user_impact": "", "diff_percent": 20.0,
+            "magnitude_score": 50.0,
+        }
+        result = await classify_issue(issue)
+        assert result["severity"] == "Critical"
+
+    @pytest.mark.asyncio
+    async def test_magnitude_15_is_medium(self):
+        issue = {
+            "element": "body paragraph", "issue_type": "spacing",
+            "description": "", "user_impact": "", "diff_percent": 5.0,
+            "magnitude_score": 15.0,
+        }
+        result = await classify_issue(issue)
+        assert result["severity"] == "Medium"
+
+    @pytest.mark.asyncio
+    async def test_magnitude_below_15_is_low(self):
+        issue = {
+            "element": "body paragraph", "issue_type": "dimension",
+            "description": "", "user_impact": "", "diff_percent": 5.0,
+            "magnitude_score": 5.0,
+        }
+        result = await classify_issue(issue)
+        assert result["severity"] == "Low"
+
+    @pytest.mark.asyncio
+    async def test_other_issue_type_with_magnitude_score_ignores_branch(self):
+        # magnitude_score is only meaningful for typography/dimension/spacing —
+        # a vision-sourced "layout" issue with a stray magnitude_score key
+        # must NOT be routed through this deterministic branch.
+        issue = {
+            "element": "checkout button", "issue_type": "layout",
+            "description": "", "user_impact": "", "diff_percent": 20.0,
+            "magnitude_score": 5.0,
+        }
+        with patch("services.severity_classifier.ask_ai") as mock_ai:
+            result = await classify_issue(issue)
+        mock_ai.assert_not_called()
+        assert result["severity"] == "Critical"  # via _rule_based's "checkout" keyword
+
+
+class TestClassifyIssueNeedsRecheck:
+    @pytest.mark.asyncio
+    async def test_needs_recheck_forced_to_medium_no_llm(self):
+        issue = {
+            "element": "nav menu",  # would rule-base to Critical if not intercepted
+            "issue_type": "needs_recheck",
+            "description": "low section-match confidence",
+            "user_impact": "", "diff_percent": 90.0,
+        }
+        with patch("services.severity_classifier.ask_ai") as mock_ai:
+            result = await classify_issue(issue)
+        mock_ai.assert_not_called()
+        assert result["severity"] == "Medium"
+
+
 class TestClassifyAll:
     @pytest.mark.asyncio
     async def test_sorted_critical_first(self):

@@ -29,10 +29,11 @@ def _is_empty_finding(description: str) -> bool:
 
 
 # Groq deprecated meta-llama/llama-4-scout-17b-16e-instruct (2026-06-17) with no
-# direct vision-capable replacement of its own — qwen/qwen3.6-27b is, per Groq's
-# own docs, the only vision-capable model they currently serve. Max 3 images/
-# request, 20MB/image — well within what this module sends (2 images per call).
-_VISION_MODEL = "qwen/qwen3.6-27b"
+# direct vision-capable replacement of its own. qwen/qwen3.6-27b was the vision
+# model at that time; Groq has since moved this org's account to qwen3.8-27b
+# (qwen3.6-27b now 404s — confirmed via GET /v1/models on 2026-09-15). Max 3
+# images/request, 20MB/image — well within what this module sends (2 images/call).
+_VISION_MODEL = "qwen/qwen3.8-27b"
 # 1568 pushed a full-page comparison to ~8310 tokens, over this org's 8000 TPM
 # cap on the on_demand tier. Image token cost barely moved at 1280 (vision
 # models tokenize in fixed patch grids with a large base cost), so dropping
@@ -40,6 +41,19 @@ _VISION_MODEL = "qwen/qwen3.6-27b"
 _MAX_IMAGE_DIM = 700
 _CANONICAL_WIDTH = 1440   # fallback logical width when a frame's own width is unavailable
 _CROP_PADDING = 30        # px of context around each diff region
+
+# analyze_section_pairs has no way to verify the two crops it hands the
+# vision model actually correspond to the same design element — the greedy
+# section matcher can pair two genuinely different sections/cards (worst on
+# pages with several near-identical repeating containers), and the LLM will
+# still confidently describe a "typography mismatch" between two unrelated
+# things if asked to. sr.match_confidence is match_sections's own pairing
+# score for this pair — below this floor, the pairing itself is suspect
+# enough that findings get downgraded to needs_recheck (still generated and
+# shown for manual review, just not reported as a confident defect) rather
+# than silently trusted. Distinct from match_sections's own min_confidence=25
+# "matched at all" floor — this is a stricter "trust the interpretation" gate.
+_MIN_CONTENT_GATE_CONFIDENCE = 50.0
 _SYSTEM_PROMPT = (
     "You are a senior QA engineer specializing in visual regression testing. "
     "You compare Figma design mockups against live Shopify storefronts and identify "
@@ -134,6 +148,10 @@ def build_issue_crops(
     canonical_width: int,
     job_id: str,
     filename: str,
+    figma_x: int | None = None,
+    figma_y: int | None = None,
+    figma_width: int | None = None,
+    figma_height: int | None = None,
 ) -> dict:
     """
     Crop the given region from the Figma frame + live screenshot, save to disk
@@ -141,10 +159,26 @@ def build_issue_crops(
     ready to merge into any issue dict — used by non-vision issue sources
     (e.g. typography_diff) so they get the same before/after thumbnails as
     vision-analyzed issues.
+
+    x/y/w/h are the LIVE-side region. figma_x/figma_y/figma_width/figma_height
+    are the matched FIGMA element's own region and default to the live-side
+    values when omitted (preserves old callers' behavior) — but callers that
+    have the real matched Figma box (typography_diff, geometry_diff) should
+    always pass it explicitly. Reusing the live-side coordinates against the
+    Figma image is exactly what produced blank/black or unrelated-content
+    Figma-side crops: the live page's total height commonly diverges from the
+    Figma frame's own height (e.g. after several repeating card rows), so an
+    unscaled live y can land outside the Figma image's real pixel bounds
+    (PIL pads that black) or on a genuinely different part of the design.
     """
+    fx = figma_x if figma_x is not None else x
+    fy = figma_y if figma_y is not None else y
+    fw = figma_width if figma_width is not None else w
+    fh = figma_height if figma_height is not None else h
+
     out: dict = {
-        "expected_crop_b64": _crop_region(figma_bytes, x, y, w, h, canonical_width),
-        "actual_crop_b64":   _crop_region(live_bytes,  x, y, w, h, canonical_width),
+        "expected_crop_b64": _crop_region(figma_bytes, fx, fy, fw, fh, canonical_width),
+        "actual_crop_b64":   _crop_region(live_bytes,  x,  y,  w,  h,  canonical_width),
     }
     if job_id:
         output_root = Path(os.environ.get("OUTPUT_DIR", "artifacts")) / "screenshots"
@@ -411,6 +445,20 @@ def analyze_section_pairs(
         except Exception as exc:
             logger.warning(f"Section AI analysis failed — '{sr.figma_section_name}': {exc}")
             section_issues = [_fallback_section_issue(sr, si)]
+
+        if sr.match_confidence < _MIN_CONTENT_GATE_CONFIDENCE:
+            logger.info(
+                f"Section pair '{sr.figma_section_name}' <-> '{sr.live_section_name}' has "
+                f"low match confidence ({sr.match_confidence:.0f} < {_MIN_CONTENT_GATE_CONFIDENCE}) "
+                f"— downgrading {len(section_issues)} finding(s) to needs_recheck instead of "
+                f"reporting as confident defects (the pairing itself is unverified)."
+            )
+            for issue in section_issues:
+                issue["issue_type"] = "needs_recheck"
+                issue["description"] = (
+                    f"[Low section-match confidence: {sr.match_confidence:.0f}] "
+                    + issue.get("description", "")
+                )
 
         before = len(section_issues)
         section_issues = [iss for iss in section_issues if not _is_empty_finding(iss.get("description", ""))]

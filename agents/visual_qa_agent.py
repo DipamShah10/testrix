@@ -18,7 +18,7 @@ from visual.section_alignment_engine import (
     normalize_section_coords,
 )
 from visual.section_comparator import compare_section_pair, SectionCompareResult
-from visual.section_matcher import match_sections
+from visual.section_matcher import match_sections, unmatched_figma_sections
 from visual.section_targeting import (
     find_live_section,
     select_first_n_sections,
@@ -249,6 +249,10 @@ async def run_visual_qa(
                             figma_frame["image_bytes"], shopify_page["screenshot"],
                             t_issue["x"], t_issue["y"], t_issue["width"], t_issue["height"],
                             frame_width, job_id, slug,
+                            figma_x=t_issue.get("figma_x", t_issue["x"]),
+                            figma_y=t_issue.get("figma_y", t_issue["y"]),
+                            figma_width=t_issue.get("figma_width", t_issue["width"]),
+                            figma_height=t_issue.get("figma_height", t_issue["height"]),
                         ))
                     return typography_issues
 
@@ -300,6 +304,10 @@ async def run_visual_qa(
                             figma_frame["image_bytes"], shopify_page["screenshot"],
                             g_issue["x"], g_issue["y"], g_issue["width"], g_issue["height"],
                             frame_width, job_id, slug,
+                            figma_x=g_issue.get("figma_x", g_issue["x"]),
+                            figma_y=g_issue.get("figma_y", g_issue["y"]),
+                            figma_width=g_issue.get("figma_width", g_issue["width"]),
+                            figma_height=g_issue.get("figma_height", g_issue["height"]),
                         ))
                     return geometry_issues
 
@@ -487,6 +495,10 @@ async def run_single_section_qa(
                         figma_frame["image_bytes"], shopify_page["screenshot"],
                         t_issue["x"], t_issue["y"], t_issue["width"], t_issue["height"],
                         frame_width, job_id, slug,
+                        figma_x=t_issue.get("figma_x", t_issue["x"]),
+                        figma_y=t_issue.get("figma_y", t_issue["y"]),
+                        figma_width=t_issue.get("figma_width", t_issue["width"]),
+                        figma_height=t_issue.get("figma_height", t_issue["height"]),
                     ))
                 return typography_issues
 
@@ -565,6 +577,10 @@ async def run_single_section_qa(
                         figma_frame["image_bytes"], shopify_page["screenshot"],
                         g_issue["x"], g_issue["y"], g_issue["width"], g_issue["height"],
                         frame_width, job_id, slug,
+                        figma_x=g_issue.get("figma_x", g_issue["x"]),
+                        figma_y=g_issue.get("figma_y", g_issue["y"]),
+                        figma_width=g_issue.get("figma_width", g_issue["width"]),
+                        figma_height=g_issue.get("figma_height", g_issue["height"]),
                     ))
                 return geometry_issues
 
@@ -728,6 +744,12 @@ async def run_multi_section_qa(
 
         safe_page_name = page_name.replace("/", "-").replace("\\", "-")
         all_issues: list[dict] = []
+        # Shared across every section in this loop so a Figma text node
+        # already claimed as one section's anchor can't also become a later
+        # section's anchor (e.g. two "Luxury SUVs" cards independently
+        # resolving to the same Figma badge) — mutated in place by
+        # derive_figma_region on each call.
+        used_anchor_indices: set[int] = set()
 
         for sec_idx, live_section in enumerate(selected_sections, 1):
             label = live_section.get("heading") or live_section.get("id") or f"section {sec_idx}"
@@ -736,6 +758,7 @@ async def run_multi_section_qa(
             figma_region = derive_figma_region(
                 live_section, figma_frame.get("text_nodes", []),
                 live_page_height, figma_frame_height, frame_width,
+                used_anchor_indices=used_anchor_indices,
             )
             live_y0 = live_section["y"]
             live_y1 = live_section["y"] + live_section["height"]
@@ -778,6 +801,10 @@ async def run_multi_section_qa(
                             figma_frame["image_bytes"], shopify_page["screenshot"],
                             issue["x"], issue["y"], issue["width"], issue["height"],
                             frame_width, job_id, slug,
+                            figma_x=issue.get("figma_x", issue["x"]),
+                            figma_y=issue.get("figma_y", issue["y"]),
+                            figma_width=issue.get("figma_width", issue["width"]),
+                            figma_height=issue.get("figma_height", issue["height"]),
                         ))
                         issue["element"] = f"[{label}] {issue.get('element', '')}"[:100]
                     return issues
@@ -894,6 +921,34 @@ async def _run_section_pipeline(
         )
         return None
 
+    # Figma sections the optimal matcher couldn't confidently pair with any
+    # live section — surface for manual review rather than silently dropping
+    # them (a Figma section with no live counterpart may mean it's genuinely
+    # missing from the live page, or that the matcher just couldn't locate
+    # it — either way worth a human look, not a confident finding either way).
+    unmatched_sections = unmatched_figma_sections(figma_sections, matched_pairs)
+    unmatched_issues = [
+        {
+            "element": fsec.get("name", "Figma section"),
+            "description": (
+                f"Figma section '{fsec.get('name', '?')}' had no confident match "
+                "on the live page — needs manual review."
+            ),
+            "user_impact": "Cannot verify this section was implemented without manual review.",
+            "suggested_fix": "Manually confirm whether this section exists on the live page.",
+            "issue_type": "needs_recheck",
+            "x": fsec.get("rel_x", 0), "y": fsec.get("rel_y", 0),
+            "width": fsec.get("width", 0), "height": fsec.get("height", 0),
+            "diff_percent": 0.0,
+        }
+        for fsec in unmatched_sections
+    ]
+    if unmatched_issues:
+        logger.info(
+            f"Job {job_id} / {page_name}: {len(unmatched_issues)} Figma section(s) "
+            "unmatched — flagged as needs_recheck"
+        )
+
     logger.info(
         f"Job {job_id} / {page_name}: section pipeline — "
         f"{len(figma_sections)} Figma sections, {len(live_with_screenshots)} live sections, "
@@ -916,7 +971,7 @@ async def _run_section_pipeline(
 
     if not significant:
         logger.info(f"No significant section diffs for {page_name} — returning empty issues")
-        return []
+        return unmatched_issues
 
     # AI analysis on significant section pairs
     issues = await run_in_threadpool(
@@ -925,7 +980,7 @@ async def _run_section_pipeline(
 
     # Annotate issues with their DOM section for the fix engine
     issues = _annotate_sections(issues, dom_sections)
-    return issues
+    return issues + unmatched_issues
 
 
 def _annotate_sections(issues: list[dict], dom_sections: list[dict]) -> list[dict]:
@@ -999,6 +1054,7 @@ async def _crossvalidate_geometry_issues(
     finding — still visible in the report's needs-recheck bucket, but not
     counted as a real design mismatch.
     """
+
     if not (spacing_issues or dimension_issues):
         return spacing_issues, dimension_issues
 

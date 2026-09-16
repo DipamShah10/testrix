@@ -12,6 +12,10 @@ pymongo
 playwright
 Pillow
 httpx
+# Direct dependency for visual/section_matcher.py's optimal assignment
+# (linear_sum_assignment) — was previously only pulled in transitively via
+# faiss-cpu/sentence-transformers, a latent breakage risk if those ever drop it.
+scipy>=1.11,<2.0
 
 # Testing
 pytest

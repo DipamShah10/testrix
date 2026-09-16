@@ -28,14 +28,35 @@ _MAX_MATCH_DISTANCE_PX = 120   # positional tolerance when text similarity is im
 _COLOR_TOLERANCE = 24          # Euclidean RGB distance below which colors are "the same"
 _SIZE_TOLERANCE_PX = 1.5       # px difference below which font-size is "the same"
 
+# Repeated near-identical labels (e.g. a "Luxury SUVs" badge on every card in
+# a fleet listing) share high text similarity with EACH OTHER on the same
+# side, not just across sides — when that happens, plain greedy
+# highest-score-first matching can cross-pair card 1's live label with card
+# 2's Figma label (and vice versa), producing two findings for the "same"
+# element with reversed, contradictory numbers. _TWIN_TEXT_SIMILARITY groups
+# same-side near-duplicates so reading order can break the tie correctly.
+_TWIN_TEXT_SIMILARITY = 0.85
+_ORDER_AGREEMENT_BONUS = 0.15
+
 
 def _normalize_family(name: str | None) -> str:
-    """Strip weight/style suffixes and quoting so 'Inter Bold' == 'Inter'."""
+    """
+    Strip weight/style suffixes and quoting so 'Inter Bold' == 'Inter', and
+    collapse word separators so 'Helvetica Neue' == 'HelveticaNeueRegular'
+    == 'Helvetica-Neue-Medium' — self-hosted webfont loaders commonly bake a
+    multi-word Figma display name into one run (with or without a hyphen)
+    while Figma keeps the spaced display name, which otherwise reads as a
+    completely different typeface. This only collapses separators between
+    words already present in the same run — it never fuzzy-matches distinct
+    names, so a real variant like 'Inter' vs 'InterDisplay' still differs
+    (no weight-suffix token to strip, nothing to collapse away).
+    """
     if not name:
         return ""
     primary = name.split(",")[0].strip()   # drop CSS fallback stack, keep primary face
     primary = primary.strip('"').strip("'").strip()
     primary = _FAMILY_SUFFIX_RE.sub("", primary).strip()
+    primary = re.sub(r"[\s\-]+", "", primary)
     return primary.lower()
 
 
@@ -67,6 +88,57 @@ def _text_similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
 
+def _twin_group_ranks(nodes: list[dict]) -> dict[int, int]:
+    """
+    Group node indices whose text closely matches EACH OTHER (>= _TWIN_TEXT_
+    SIMILARITY, same side, e.g. figma-vs-figma), then rank each group's
+    members by reading order (y ascending, x tiebreak).
+
+    Returns {node_index: rank_within_its_twin_group} — only for indices that
+    belong to a group of size > 1 (an unambiguous singleton is simply absent
+    from the returned dict, so callers treat it as "no tiebreak applies" via
+    a plain .get() lookup).
+    """
+    n = len(nodes)
+    parent = list(range(n))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i: int, j: int) -> None:
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[ri] = rj
+
+    for i in range(n):
+        text_i = nodes[i].get("text", "")
+        if not text_i:
+            continue
+        for j in range(i + 1, n):
+            text_j = nodes[j].get("text", "")
+            if not text_j:
+                continue
+            if _text_similarity(text_i, text_j) >= _TWIN_TEXT_SIMILARITY:
+                union(i, j)
+
+    groups: dict[int, list[int]] = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+
+    ranks: dict[int, int] = {}
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        members.sort(key=lambda idx: (nodes[idx].get("y", 0), nodes[idx].get("x", 0)))
+        for rank, idx in enumerate(members):
+            ranks[idx] = rank
+
+    return ranks
+
+
 def match_text_nodes(
     figma_nodes: list[dict],
     live_nodes: list[dict],
@@ -85,6 +157,12 @@ def match_text_nodes(
     if not figma_nodes or not live_nodes:
         return []
 
+    # Same-side near-duplicate groups (e.g. several "Luxury SUVs" badges) —
+    # a no-op lookup for the common case (every text on the page is unique),
+    # only kicking in when real ambiguity exists on both sides at once.
+    figma_ranks = _twin_group_ranks(figma_nodes)
+    live_ranks = _twin_group_ranks(live_nodes)
+
     candidates = []
     for fi, fnode in enumerate(figma_nodes):
         if not fnode.get("text"):
@@ -101,6 +179,14 @@ def match_text_nodes(
             if dist > _MAX_MATCH_DISTANCE_PX and sim < 0.9:
                 continue
             score = sim - (dist / 5000)
+            # When both sides have genuine ambiguity (2+ near-identical
+            # candidates), reward pairs whose reading-order rank agrees —
+            # this is what makes card-1's live label prefer card-1's Figma
+            # label over card-2's, instead of an arbitrary highest-score pick.
+            f_rank = figma_ranks.get(fi)
+            l_rank = live_ranks.get(li)
+            if f_rank is not None and l_rank is not None and f_rank == l_rank:
+                score += _ORDER_AGREEMENT_BONUS
             candidates.append((score, fi, li))
 
     candidates.sort(key=lambda c: -c[0])
@@ -127,14 +213,7 @@ def _diff_pair(fnode: dict, lnode: dict) -> list[tuple[str, str, str, float]]:
     problem than a button one weight-step lighter than spec, and severity should
     reflect that instead of every typography hit landing in the same tier.
     """
-    mismatches: list[tuple[str, str, str, float]] = []
-
-    f_family = _normalize_family(fnode.get("font_family"))
-    l_family = _normalize_family(lnode.get("font_family"))
-    if f_family and l_family and f_family != l_family:
-        # A completely different typeface is the most visually disruptive
-        # typography defect — flat weight, not proportional to anything.
-        mismatches.append(("font family", fnode.get("font_family") or "", lnode.get("font_family") or "", 40.0))
+    other_mismatches: list[tuple[str, str, str, float]] = []
 
     f_weight, l_weight = fnode.get("font_weight"), lnode.get("font_weight")
     try:
@@ -142,7 +221,7 @@ def _diff_pair(fnode: dict, lnode: dict) -> list[tuple[str, str, str, float]]:
             steps = abs(int(round(float(f_weight))) - int(round(float(l_weight)))) / 100.0
             # One weight step (e.g. Regular vs Medium) is a minor, often barely
             # perceptible difference; multiple steps (Regular vs Bold+) is not.
-            mismatches.append(("font weight", _weight_label(f_weight), _weight_label(l_weight), min(30.0, steps * 12.0)))
+            other_mismatches.append(("font weight", _weight_label(f_weight), _weight_label(l_weight), min(30.0, steps * 12.0)))
     except (TypeError, ValueError):
         pass
 
@@ -150,7 +229,7 @@ def _diff_pair(fnode: dict, lnode: dict) -> list[tuple[str, str, str, float]]:
     try:
         if f_size and l_size and abs(float(f_size) - float(l_size)) > _SIZE_TOLERANCE_PX:
             pct = abs(float(f_size) - float(l_size)) / float(f_size) * 100.0
-            mismatches.append(("font size", f"{f_size}px", f"{l_size}px", min(40.0, pct)))
+            other_mismatches.append(("font size", f"{f_size}px", f"{l_size}px", min(40.0, pct)))
     except (TypeError, ValueError):
         pass
 
@@ -160,8 +239,27 @@ def _diff_pair(fnode: dict, lnode: dict) -> list[tuple[str, str, str, float]]:
         dist = _color_distance(f_color, l_color)
         if dist > _COLOR_TOLERANCE:
             # Max possible RGB distance is ~441 (black vs white) — scale to 0-20.
-            mismatches.append(("color", f"rgb{tuple(f_color)}", f"rgb{l_color}", min(20.0, dist / 441.0 * 20.0)))
+            other_mismatches.append(("color", f"rgb{tuple(f_color)}", f"rgb{l_color}", min(20.0, dist / 441.0 * 20.0)))
 
+    mismatches: list[tuple[str, str, str, float]] = []
+
+    f_family = _normalize_family(fnode.get("font_family"))
+    l_family = _normalize_family(lnode.get("font_family"))
+    if f_family and l_family and f_family != l_family:
+        # A font-family mismatch that comes WITH a real weight/size/color
+        # difference is a genuinely different typeface rendering visibly
+        # differently — weight it heavily. But a BARE font-family mismatch
+        # (nothing else about the text differs) is often not something a
+        # human would actually notice: many distinct font-family names
+        # render near-identically at normal body/label sizes and weights —
+        # confirmed against a real report where "HelveticaNeueRegular" vs
+        # "Inter Display" was visually indistinguishable side-by-side.
+        # Weight it low enough to land at Low rather than a confident High,
+        # so it's still surfaced for review but doesn't crowd out real bugs.
+        magnitude = 40.0 if other_mismatches else 10.0
+        mismatches.append(("font family", fnode.get("font_family") or "", lnode.get("font_family") or "", magnitude))
+
+    mismatches.extend(other_mismatches)
     return mismatches
 
 
@@ -213,6 +311,15 @@ def compare_typography(
             "y": lnode.get("y", 0),
             "width": lnode.get("width", 0),
             "height": lnode.get("height", 0),
+            # The matched Figma element's OWN box — kept separate from the
+            # live box above so the Figma-side crop can be sliced from the
+            # right place in the Figma frame image instead of reusing the
+            # live element's (different coordinate space) position, which
+            # produces either a blank/black crop or a real-but-unrelated one.
+            "figma_x": fnode.get("x", 0),
+            "figma_y": fnode.get("y", 0),
+            "figma_width": fnode.get("width", 0),
+            "figma_height": fnode.get("height", 0),
             # Not a pixel-diff percentage — a severity signal proportional to
             # how many style properties disagree, so severity_classifier's
             # diff_percent-based rules route these to at least "Medium".

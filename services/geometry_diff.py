@@ -128,6 +128,12 @@ def compare_dimensions(
             "issue_type": "dimension",
             "x": litem.get("x", 0), "y": litem.get("y", 0),
             "width": lw, "height": lh,
+            # The matched Figma element's own box, kept separate from the
+            # live box above — see typography_diff.py's compare_typography
+            # for why: reusing live coords against the Figma image produces
+            # a blank/wrong crop.
+            "figma_x": fitem.get("x", 0), "figma_y": fitem.get("y", 0),
+            "figma_width": fw, "figma_height": fh,
             "diff_percent": min(100.0, magnitude),
             # Consumed directly by severity_classifier, same pattern as
             # typography's magnitude_score — a 9% size miss shouldn't rank the
@@ -150,6 +156,19 @@ def _effective_box(item: dict) -> dict:
     """
     box = item.get("spacing_box")
     return box if box else item
+
+
+def _union_box(a: dict, b: dict) -> dict:
+    """Bounding box that encloses both a and b — used so a spacing issue's
+    crop actually shows the whitespace gap being measured (target + its
+    neighbor + the space between them), instead of a tight crop around just
+    the target that cuts the gap off entirely and leaves nothing for a human
+    reviewer to actually verify."""
+    x0 = min(a["x"], b["x"])
+    y0 = min(a["y"], b["y"])
+    x1 = max(a["x"] + a["width"], b["x"] + b["width"])
+    y1 = max(a["y"] + a["height"], b["y"] + b["height"])
+    return {"x": x0, "y": y0, "width": x1 - x0, "height": y1 - y0}
 
 
 def _find_nearest_above(target: dict, boxes: list[dict]) -> tuple[dict | None, float | None]:
@@ -288,11 +307,11 @@ def compare_spacing(
 
         label = ftarget.get(label_field) or ltarget.get(label_field) or "element"
 
-        for direction, f_gap, l_gap in (
-            ("above", f_gap_above, l_gap_above),
-            ("below", f_gap_below, l_gap_below),
-            ("left of", f_gap_left, l_gap_left),
-            ("right of", f_gap_right, l_gap_right),
+        for direction, f_gap, l_gap, f_neighbor, l_neighbor in (
+            ("above", f_gap_above, l_gap_above, f_above, l_above),
+            ("below", f_gap_below, l_gap_below, f_below, l_below),
+            ("left of", f_gap_left, l_gap_left, f_left, l_left),
+            ("right of", f_gap_right, l_gap_right, f_right, l_right),
         ):
             if f_gap is None or l_gap is None:
                 continue
@@ -306,6 +325,18 @@ def compare_spacing(
                 continue
             pct = (diff / f_gap * 100) if f_gap > 1 else 100.0
 
+            # Crop region spans target + neighbor (+ the gap between them) on
+            # each side, rather than just the target's own tight box — a
+            # crop that doesn't show the whitespace being complained about
+            # gives a human reviewer nothing to actually verify the claim
+            # against. Falls back to the target's own box only if a neighbor
+            # is somehow missing (shouldn't happen given f_gap/l_gap above
+            # are already non-None, but stay defensive).
+            live_region = _union_box(_effective_box(ltarget), _effective_box(l_neighbor)) \
+                if l_neighbor is not None else ltarget
+            figma_region = _union_box(_effective_box(ftarget), _effective_box(f_neighbor)) \
+                if f_neighbor is not None else ftarget
+
             issues.append({
                 "element": f"spacing {direction} {label}"[:80],
                 "description": (
@@ -315,8 +346,14 @@ def compare_spacing(
                 "user_impact": "Inconsistent spacing disrupts visual rhythm and can make the layout feel unpolished.",
                 "suggested_fix": f"Adjust the {direction} spacing to {f_gap:.0f}px to match the Figma spec.",
                 "issue_type": "spacing",
-                "x": ltarget.get("x", 0), "y": ltarget.get("y", 0),
-                "width": ltarget.get("width", 0), "height": ltarget.get("height", 0),
+                "x": live_region.get("x", 0), "y": live_region.get("y", 0),
+                "width": live_region.get("width", 0), "height": live_region.get("height", 0),
+                # The matched Figma element's own (widened) box — see
+                # compare_dimensions above / typography_diff.compare_typography
+                # for why this must stay separate from the live box
+                # (Figma-side crop correctness).
+                "figma_x": figma_region.get("x", 0), "figma_y": figma_region.get("y", 0),
+                "figma_width": figma_region.get("width", 0), "figma_height": figma_region.get("height", 0),
                 "diff_percent": min(100.0, pct),
                 # Severity magnitude scales with the real pixel difference, not
                 # a percentage — a 3px miss just past the tolerance floor should

@@ -84,8 +84,13 @@ def build_page_report(
     # "this region couldn't be reliably compared" (blank capture, rotating
     # carousel/UGC content). Counting them alongside real defects would let a
     # handful of unrenderable regions drag a clean page down to "Critical" and
-    # bury the signal QA/dev teams actually need to act on.
-    _NON_DEFECT_TYPES = {"capture_failure", "expected_variance"}
+    # bury the signal QA/dev teams actually need to act on. needs_recheck is
+    # the same idea for a different reason: the Figma<->live PAIRING itself
+    # was low-confidence (vision-LLM content gate, or an unmatched section
+    # from the optimal matcher) — not confirmed as either a real defect or a
+    # non-issue, so it goes to the same "needs manual review" bucket rather
+    # than being reported as a confident finding either way.
+    _NON_DEFECT_TYPES = {"capture_failure", "expected_variance", "needs_recheck"}
     defect_issues = _group_similar_issues([i for i in issues if i.get("issue_type") not in _NON_DEFECT_TYPES])
     non_defect_issues = _group_similar_issues([i for i in issues if i.get("issue_type") in _NON_DEFECT_TYPES])
 
