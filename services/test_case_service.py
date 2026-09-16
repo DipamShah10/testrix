@@ -1,4 +1,5 @@
 import logging
+from fastapi.concurrency import run_in_threadpool
 from ai_engine.llm import ask_ai
 from ai_engine.prompts import test_case_prompt
 from ai_engine.utils import extract_json_array
@@ -8,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 
 async def generate_test_cases(feature: str):
-    context = search_context(feature)
+    context = await run_in_threadpool(search_context, feature)
     prompt = test_case_prompt(feature, context)
     raw = await ask_ai(prompt)
 

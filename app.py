@@ -23,15 +23,19 @@ from dotenv import load_dotenv
 from services.bug_analysis_service import analyze_bug as basic_bug_analysis
 from agents.bug_agent import analyze_bug as agent_analyze_bug
 from agents.agent_manager import run_qa_ai
-from services.test_runner import run_tests
-from agents.visual_qa_agent import run_visual_qa, run_single_section_qa, run_multi_section_qa
-from agents.ai_crawl_agent import run_ai_crawl
+# Lazy import for test_runner to avoid greenlet DLL issue on Windows
+# from services.test_runner import run_tests
+# Lazy import for visual_qa_agent to avoid greenlet DLL issue on Windows
+# from agents.visual_qa_agent import run_visual_qa, run_single_section_qa, run_multi_section_qa
+# Lazy import for ai_crawl_agent to avoid greenlet DLL issue on Windows
+# from agents.ai_crawl_agent import run_ai_crawl
 from services.db import (
     get_history, get_history_item, delete_history_item,
     create_vqa_job, get_vqa_job,
     create_ai_crawl_job, get_ai_crawl_job,
 )
-from services.site_crawler import discover_site
+# Lazy import for site_crawler to avoid greenlet DLL issue on Windows
+# from services.site_crawler import discover_site
 
 load_dotenv()
 
@@ -172,6 +176,87 @@ class AICrawlRequest(BaseModel):
     max_depth: int = Field(default=2, ge=0, le=4, description="BFS link depth from seed/sitemap")
 
 
+# ---------- Lazy-loaded wrapper functions to avoid greenlet DLL issues ----------
+
+async def _lazy_run_ai_crawl(
+    job_id: str,
+    seed_url: str,
+    max_pages: int,
+    max_depth: int,
+):
+    """Lazy-loaded wrapper for run_ai_crawl"""
+    from agents.ai_crawl_agent import run_ai_crawl
+    await run_ai_crawl(job_id=job_id, seed_url=seed_url, max_pages=max_pages, max_depth=max_depth)
+
+
+async def _lazy_run_visual_qa(
+    job_id: str,
+    shopify_url: str,
+    figma_url: str,
+    pages: list[str],
+    shopify_password: str | None = None,
+    diff_threshold: float = 0.05,
+    exclude_sections: list[str] | None = None,
+):
+    """Lazy-loaded wrapper for run_visual_qa"""
+    from agents.visual_qa_agent import run_visual_qa
+    await run_visual_qa(
+        job_id=job_id,
+        shopify_url=shopify_url,
+        figma_url=figma_url,
+        pages=pages,
+        shopify_password=shopify_password,
+        diff_threshold=diff_threshold,
+        exclude_sections=exclude_sections or [],
+    )
+
+
+async def _lazy_run_single_section_qa(
+    job_id: str,
+    shopify_url: str,
+    figma_url: str,
+    page_name: str,
+    target_section: str,
+    shopify_password: str | None = None,
+    include_typography: bool = True,
+):
+    """Lazy-loaded wrapper for run_single_section_qa"""
+    from agents.visual_qa_agent import run_single_section_qa
+    await run_single_section_qa(
+        job_id=job_id,
+        shopify_url=shopify_url,
+        figma_url=figma_url,
+        page_name=page_name,
+        target_section=target_section,
+        shopify_password=shopify_password,
+        include_typography=include_typography,
+    )
+
+
+async def _lazy_run_multi_section_qa(
+    job_id: str,
+    shopify_url: str,
+    figma_url: str,
+    page_name: str,
+    section_limit: int,
+    exclude_sections: list[str] | None = None,
+    shopify_password: str | None = None,
+    include_typography: bool = True,
+):
+    """Lazy-loaded wrapper for run_multi_section_qa"""
+    from agents.visual_qa_agent import run_multi_section_qa
+    await run_multi_section_qa(
+        job_id=job_id,
+        shopify_url=shopify_url,
+        figma_url=figma_url,
+        page_name=page_name,
+        section_limit=section_limit,
+        exclude_sections=exclude_sections or [],
+        shopify_password=shopify_password,
+        include_typography=include_typography,
+    )
+
+
 # ---------- Health ----------
 
 @app.get("/")
@@ -188,7 +273,8 @@ async def crawl_site_api(request: Request, body: CrawlRequest):
     Discover URLs on the same host as ``seed_url`` via sitemap.xml (+ index) and HTML link BFS.
     Returns ``routes_for_pipeline`` path strings suitable for ``main.py --pages`` / ``BrowserAgent``.
     """
-    from services.shopify_scraper import validate_url
+    from services.url_validator import validate_url
+    from services.site_crawler import discover_site  # Lazy import
 
     try:
         validate_url(body.seed_url)
@@ -230,7 +316,7 @@ async def ai_crawl_start(request: Request, body: AICrawlRequest, background_task
     )
 
     background_tasks.add_task(
-        run_ai_crawl,
+        _lazy_run_ai_crawl,
         job_id=job_id,
         seed_url=body.seed_url,
         max_pages=body.max_pages,
@@ -337,6 +423,7 @@ async def run_tests_api(request: Request, body: RunTestsRequest):
     if not body.test_cases:
         return JSONResponse(status_code=422, content={"error": "test_cases must not be empty"})
     try:
+        from services.test_runner import run_tests  # Lazy import to avoid greenlet DLL issues
         logger.info(f"Running {len(body.test_cases)} tests against {body.base_url}")
         result = await run_tests(
             base_url=body.base_url,
@@ -365,19 +452,23 @@ async def visual_qa_start(request: Request, body: VisualQARequest, background_ta
         logger.warning(f"/visual-qa called but missing env vars: {missing}")
 
     try:
-        from services.shopify_scraper import validate_url
-        validate_url(body.shopify_url)
-    except ValueError as e:
-        return JSONResponse(status_code=422, content={"error": str(e)})
+        try:
+            from services.url_validator import validate_url
+            validate_url(body.shopify_url)
+        except ValueError as e:
+            return JSONResponse(status_code=422, content={"error": str(e)})
 
-    job_id = await run_in_threadpool(
-        create_vqa_job, body.shopify_url, body.figma_url, body.pages
-    )
+        job_id = await run_in_threadpool(
+            create_vqa_job, body.shopify_url, body.figma_url, body.pages
+        )
+    except Exception as e:
+        logger.error(f"/visual-qa error during setup: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": f"Setup error: {str(e)}"})
 
     if body.target_section:
         page_name = body.pages[0] if body.pages else "home"
         background_tasks.add_task(
-            run_single_section_qa,
+            _lazy_run_single_section_qa,
             job_id=job_id,
             shopify_url=body.shopify_url,
             figma_url=body.figma_url,
@@ -393,7 +484,7 @@ async def visual_qa_start(request: Request, body: VisualQARequest, background_ta
     elif body.section_limit:
         page_name = body.pages[0] if body.pages else "home"
         background_tasks.add_task(
-            run_multi_section_qa,
+            _lazy_run_multi_section_qa,
             job_id=job_id,
             shopify_url=body.shopify_url,
             figma_url=body.figma_url,
@@ -410,7 +501,7 @@ async def visual_qa_start(request: Request, body: VisualQARequest, background_ta
         )
     else:
         background_tasks.add_task(
-            run_visual_qa,
+            _lazy_run_visual_qa,
             job_id=job_id,
             shopify_url=body.shopify_url,
             figma_url=body.figma_url,
