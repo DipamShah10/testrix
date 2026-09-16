@@ -102,6 +102,7 @@ class TestVisualComparatorStep:
 
 # ── Step 2: Visual AI Analyzer ────────────────────────────────────────────────
 
+@pytest.mark.live_api
 class TestVisualAIAnalyzerStep:
     def test_ai_analyzes_diff_regions(self):
         from services.visual_comparator import compare
@@ -140,11 +141,21 @@ class TestVisualAIAnalyzerStep:
             assert "element" in issue
             assert "description" in issue
             assert "issue_type" in issue
-            assert issue["issue_type"] in ("typography", "layout", "color", "spacing", "image", "other")
+            # Full valid set per the vision model's own prompt (visual_ai_analyzer.py) —
+            # capture_failure/expected_variance are legitimate, expected outputs (a
+            # blank/loading-placeholder region, or rotating carousel/UGC content),
+            # not error states. Omitting them here was a stale assertion that made
+            # this test flaky: which issue_type comes back depends on the live
+            # Groq vision call's non-deterministic read of the synthetic test image.
+            assert issue["issue_type"] in (
+                "typography", "layout", "color", "spacing", "image",
+                "capture_failure", "expected_variance", "other",
+            )
 
 
 # ── Step 3: Severity Classifier ───────────────────────────────────────────────
 
+@pytest.mark.live_api
 class TestSeverityClassifierStep:
     @pytest.mark.asyncio
     async def test_classifies_issues_from_ai(self):
@@ -189,6 +200,7 @@ class TestSeverityClassifierStep:
 
 # ── Step 4: Fix Recommendation Engine ────────────────────────────────────────
 
+@pytest.mark.live_api
 class TestFixRecommendationStep:
     @pytest.mark.asyncio
     async def test_generates_fix_recommendations(self):
@@ -235,6 +247,7 @@ class TestFixRecommendationStep:
 
 # ── Step 5: Full pipeline (run_visual_qa) with mocked Figma + Shopify + MongoDB
 
+@pytest.mark.live_api
 class TestFullVisualQAPipeline:
     @pytest.mark.asyncio
     async def test_run_visual_qa_end_to_end(self):

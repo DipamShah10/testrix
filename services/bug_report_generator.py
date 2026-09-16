@@ -16,6 +16,29 @@ def _b64(data: bytes | None) -> str | None:
     return base64.b64encode(data).decode() if data else None
 
 
+_GAP_GROUP_TOLERANCE_PX = 1.5  # figma_gap_px/live_gap_px within this are "the same gap"
+
+# EXPERIMENT, TRIED AND REVERTED: matching spacing issues purely by numeric
+# gap similarity (regardless of direction) looked correct on a small,
+# hand-picked real example (three pill-row elements all reporting "34px vs
+# 10px"), but broke badly on a full real page run — it collapsed 39 issues
+# spanning all 5 page sections, including a horizontal "left of" gap grouped
+# with vertical "above"/"below" gaps, into one report entry. That's not one
+# systemic CSS rule; it's the tolerance being far too loose once a real page
+# has many independently-occurring gaps of similar magnitude — and grouping
+# is a one-way door: 38 potentially-real, distinct defects would be hidden
+# behind a single entry with no way for a reviewer to recover them. Hiding
+# real bugs is a worse failure than the 3-duplicate noise this was meant to
+# fix, so this is reverted rather than shipped without being able to fully
+# verify its safety. geometry_diff.py still emits gap_direction/figma_gap_px/
+# live_gap_px on every spacing issue — a future attempt should require an
+# exact direction match AND probably tag *why* two gaps are suspected to
+# share a cause (e.g. same neighbor element, same CSS class) rather than
+# coincidence of measured magnitude alone.
+def _same_spacing_pattern(a: dict, b: dict) -> bool:
+    return False
+
+
 def _group_similar_issues(issues: list[dict]) -> list[dict]:
     """
     Collapse issues that are the same underlying defect hitting multiple
@@ -26,7 +49,10 @@ def _group_similar_issues(issues: list[dict]) -> list[dict]:
 
     Grouped within the same issue_type by description text similarity (not
     exact match — vision-generated descriptions vary in wording even when
-    describing the same underlying observation).
+    describing the same underlying observation). Also checks
+    _same_spacing_pattern first, which is currently disabled (always False,
+    see its docstring for why) — kept as the extension point for a future,
+    safer numeric-gap-matching attempt.
     """
     groups: list[dict] = []  # each: {"rep": issue, "occurrences": [issue, ...]}
 
@@ -37,6 +63,9 @@ def _group_similar_issues(issues: list[dict]) -> list[dict]:
         for g in groups:
             if g["rep"].get("issue_type") != itype:
                 continue
+            if _same_spacing_pattern(issue, g["rep"]):
+                match = g
+                break
             sim = SequenceMatcher(None, desc, (g["rep"].get("description") or "").lower()).ratio()
             if sim >= _GROUP_SIMILARITY_THRESHOLD:
                 match = g

@@ -354,6 +354,21 @@ def compare_spacing(
                 # (Figma-side crop correctness).
                 "figma_x": figma_region.get("x", 0), "figma_y": figma_region.get("y", 0),
                 "figma_width": figma_region.get("width", 0), "figma_height": figma_region.get("height", 0),
+                # Structured numeric fields (as opposed to only baking these
+                # into the free-text description) — intended for
+                # bug_report_generator to eventually recognize "same
+                # direction, same before/after gap, different element" as
+                # one systemic spacing rule hitting several instances,
+                # instead of N unrelated bugs that happen to read similarly.
+                # NOTE: that consumer (_same_spacing_pattern) is currently
+                # disabled — see its docstring — because a naive version
+                # over-grouped on a real page. These fields are harmless to
+                # keep populated as the foundation for a safer future
+                # attempt (e.g. requiring an exact direction match plus a
+                # real shared-cause signal, not magnitude coincidence alone).
+                "gap_direction": direction,
+                "figma_gap_px": round(f_gap, 1),
+                "live_gap_px": round(l_gap, 1),
                 "diff_percent": min(100.0, pct),
                 # Severity magnitude scales with the real pixel difference, not
                 # a percentage — a 3px miss just past the tolerance floor should

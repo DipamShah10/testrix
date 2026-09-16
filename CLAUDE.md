@@ -72,7 +72,7 @@ testrix/
 ├── qa/
 │   └── fix_recommendation_engine.py # AI-generated developer-ready fix guides per issue
 │
-├── tests/                          # pytest suite (104 tests, no external calls)
+├── tests/                          # pytest suite (196 tests, no external calls by default)
 │   ├── test_utils.py
 │   ├── test_severity_classifier.py
 │   ├── test_visual_comparator.py
@@ -183,9 +183,11 @@ POST /visual-qa → MongoDB job (pending) → BackgroundTask
 ## Running Tests
 
 ```bash
-pytest           # run all 104 tests
+pytest           # run all 196 default tests (deterministic, no external calls)
 pytest -q        # quiet mode
 pytest tests/test_visual_comparator.py  # single file
+pytest -m live_api  # the 4 tests that hit the real Groq API — rate-limited,
+                    # non-deterministic; run explicitly, not part of CI
 ```
 
 Tests cover pure/deterministic code only. LLM-dependent paths are mocked with `unittest.mock`. No external API calls are made during tests.
