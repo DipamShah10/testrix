@@ -1,0 +1,19 @@
+# Production/deploy dependency set — deliberately excludes langchain,
+# langchain-community, faiss-cpu, and sentence-transformers from
+# requirements.txt. Those exist solely for the deprecated /test-cases RAG
+# endpoint (app.py imports them lazily inside that one handler specifically
+# so Visual QA never depends on them) and pull in torch, which roughly
+# triples image size and build time for a feature this deployment doesn't
+# use. Keep this file's package set in sync with requirements.txt for
+# everything Visual QA actually touches.
+fastapi
+uvicorn
+openai
+python-dotenv
+numpy
+slowapi
+pymongo
+playwright
+Pillow
+httpx
+scipy>=1.11,<2.0
