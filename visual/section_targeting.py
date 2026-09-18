@@ -41,14 +41,20 @@ def select_first_n_sections(
     dom_sections: list[dict],
     n: int,
     exclude_types: set[str] | None = None,
+    from_end: bool = False,
 ) -> list[dict]:
     """
-    Pick the first N sections in page order (top to bottom), after dropping
-    any section whose classified type is in exclude_types (e.g. {"nav",
+    Pick N sections in page order (top to bottom), after dropping any
+    section whose classified type is in exclude_types (e.g. {"nav",
     "footer"}) — so "test the first 3 sections" means the first 3 sections a
     user would actually scroll through as real content, not the first 3
     entries in whatever order the DOM happened to list them, and not header/
     footer even if they appear early/late in that raw order.
+
+    from_end=True picks the LAST N instead (e.g. "test the last 3 sections"
+    — a closing/footer-adjacent block, contact section, etc.) — still
+    returned in page order (top to bottom), not reversed, so downstream
+    per-section iteration reads top-to-bottom either way.
     """
     exclude_types = exclude_types or set()
     kept = [
@@ -56,6 +62,8 @@ def select_first_n_sections(
         if _detect_type(_section_label(s)) not in exclude_types
     ]
     kept.sort(key=lambda s: s.get("y", 0))
+    if from_end:
+        return kept[-n:] if n > 0 else []
     return kept[:n]
 
 

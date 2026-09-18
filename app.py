@@ -145,12 +145,22 @@ class VisualQARequest(BaseModel):
     section_limit: int | None = Field(
         default=None, ge=1, le=20,
         description=(
-            "Scope the run to the first N real-content sections of the page, in page "
-            "order, after dropping any excluded section types (see exclude_sections) "
-            "— e.g. section_limit=3 tests the first 3 sections a visitor would "
-            "actually scroll through, skipping the header/footer even if excluded "
-            "types would otherwise be counted. Only the first entry in `pages` is "
-            "used. Mutually exclusive with `target_section`."
+            "Scope the run to the first N (or last N, with section_from_end=true) "
+            "real-content sections of the page, in page order, after dropping any "
+            "excluded section types (see exclude_sections) — e.g. section_limit=3 "
+            "tests the first 3 sections a visitor would actually scroll through, "
+            "skipping the header/footer even if excluded types would otherwise be "
+            "counted. Only the first entry in `pages` is used. Mutually exclusive "
+            "with `target_section`."
+        ),
+    )
+    section_from_end: bool = Field(
+        default=False,
+        description=(
+            "With section_limit set, count from the END of the page instead of the "
+            "start — e.g. section_limit=3, section_from_end=true tests the last 3 "
+            "sections (a closing/contact block etc.) instead of the first 3. "
+            "Ignored when section_limit is not set."
         ),
     )
     include_typography: bool = Field(
@@ -242,6 +252,7 @@ async def _lazy_run_multi_section_qa(
     exclude_sections: list[str] | None = None,
     shopify_password: str | None = None,
     include_typography: bool = True,
+    section_from_end: bool = False,
 ):
     """Lazy-loaded wrapper for run_multi_section_qa"""
     from agents.visual_qa_agent import run_multi_section_qa
@@ -254,6 +265,7 @@ async def _lazy_run_multi_section_qa(
         exclude_sections=exclude_sections or [],
         shopify_password=shopify_password,
         include_typography=include_typography,
+        section_from_end=section_from_end,
     )
 
 
@@ -493,11 +505,12 @@ async def visual_qa_start(request: Request, body: VisualQARequest, background_ta
             exclude_sections=body.exclude_sections,
             shopify_password=body.shopify_password,
             include_typography=body.include_typography,
+            section_from_end=body.section_from_end,
         )
         logger.info(
             f"Visual QA job started — id={job_id}, page={page_name}, "
-            f"section_limit={body.section_limit}, exclude={body.exclude_sections}, "
-            f"include_typography={body.include_typography}"
+            f"section_limit={body.section_limit}, section_from_end={body.section_from_end}, "
+            f"exclude={body.exclude_sections}, include_typography={body.include_typography}"
         )
     else:
         background_tasks.add_task(

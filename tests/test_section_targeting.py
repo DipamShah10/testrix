@@ -137,6 +137,21 @@ class TestSelectFirstNSections:
         assert result[0]["y"] == 100
         assert result[1]["y"] == 200
 
+    def test_from_end_picks_last_n_in_page_order(self):
+        sections = [_dom_section(y=100), _dom_section(y=200), _dom_section(y=300), _dom_section(y=400)]
+        result = select_first_n_sections(sections, 2, from_end=True)
+        assert len(result) == 2
+        # Last 2 by y (300, 400), but still returned top-to-bottom, not reversed.
+        assert result[0]["y"] == 300
+        assert result[1]["y"] == 400
+
+    def test_from_end_with_fewer_sections_than_n_returns_all(self):
+        sections = [_dom_section(y=100), _dom_section(y=200)]
+        result = select_first_n_sections(sections, 5, from_end=True)
+        assert len(result) == 2
+        assert result[0]["y"] == 100
+        assert result[1]["y"] == 200
+
 
 class TestFilterNodesInRegion:
     def test_keeps_only_nodes_with_center_in_range(self):

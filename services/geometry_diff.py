@@ -171,6 +171,22 @@ def _union_box(a: dict, b: dict) -> dict:
     return {"x": x0, "y": y0, "width": x1 - x0, "height": y1 - y0}
 
 
+# Confirmed real bug: browser-extracted DOM text boxes (getBoundingClientRect)
+# routinely extend a few px past a line's visible glyphs because of CSS
+# line-height — two block-level siblings that render with zero visual gap
+# between them (a heading immediately followed by a paragraph) can still end
+# up with bounding boxes that overlap by a handful of pixels. The original
+# strict adjacency check (`bottom <= target.y`) treated that overlap as "not
+# above/below at all" and excluded the true nearest neighbor outright,
+# falling through to the next candidate that happened to satisfy the strict
+# check — which can be a completely different, much farther element (an
+# eyebrow/kicker label sitting above the excluded heading, in one confirmed
+# real case: reported as a 118px gap when the actual visual gap was ~0px).
+# Tolerating a small overlap treats these as touching (gap floored at 0)
+# instead of invisible to the search.
+_ADJACENCY_OVERLAP_TOLERANCE_PX = 8
+
+
 def _find_nearest_above(target: dict, boxes: list[dict]) -> tuple[dict | None, float | None]:
     """Nearest box directly above `target` with horizontal overlap."""
     t = _effective_box(target)
@@ -184,8 +200,8 @@ def _find_nearest_above(target: dict, boxes: list[dict]) -> tuple[dict | None, f
         if bx1 <= tx0 or bx0 >= tx1:
             continue
         bottom = bx["y"] + bx["height"]
-        if bottom <= t["y"]:
-            gap = t["y"] - bottom
+        if bottom <= t["y"] + _ADJACENCY_OVERLAP_TOLERANCE_PX:
+            gap = max(0.0, t["y"] - bottom)
             if best_gap is None or gap < best_gap:
                 best, best_gap = b, gap
     return best, best_gap
@@ -203,8 +219,9 @@ def _find_nearest_below(target: dict, boxes: list[dict]) -> tuple[dict | None, f
         bx0, bx1 = bx["x"], bx["x"] + bx["width"]
         if bx1 <= tx0 or bx0 >= tx1:
             continue
-        if bx["y"] >= t["y"] + t["height"]:
-            gap = bx["y"] - (t["y"] + t["height"])
+        target_bottom = t["y"] + t["height"]
+        if bx["y"] >= target_bottom - _ADJACENCY_OVERLAP_TOLERANCE_PX:
+            gap = max(0.0, bx["y"] - target_bottom)
             if best_gap is None or gap < best_gap:
                 best, best_gap = b, gap
     return best, best_gap
@@ -225,8 +242,8 @@ def _find_nearest_left(target: dict, boxes: list[dict]) -> tuple[dict | None, fl
         if by1 <= ty0 or by0 >= ty1:
             continue
         right = bx["x"] + bx["width"]
-        if right <= t["x"]:
-            gap = t["x"] - right
+        if right <= t["x"] + _ADJACENCY_OVERLAP_TOLERANCE_PX:
+            gap = max(0.0, t["x"] - right)
             if best_gap is None or gap < best_gap:
                 best, best_gap = b, gap
     return best, best_gap
@@ -244,8 +261,9 @@ def _find_nearest_right(target: dict, boxes: list[dict]) -> tuple[dict | None, f
         by0, by1 = bx["y"], bx["y"] + bx["height"]
         if by1 <= ty0 or by0 >= ty1:
             continue
-        if bx["x"] >= t["x"] + t["width"]:
-            gap = bx["x"] - (t["x"] + t["width"])
+        target_right = t["x"] + t["width"]
+        if bx["x"] >= target_right - _ADJACENCY_OVERLAP_TOLERANCE_PX:
+            gap = max(0.0, bx["x"] - target_right)
             if best_gap is None or gap < best_gap:
                 best, best_gap = b, gap
     return best, best_gap
@@ -271,6 +289,7 @@ def compare_spacing(
     matched_targets: list[tuple[dict, dict]],
     label_field: str = "label",
     suppress_minor_side_gaps: bool = False,
+    figma_scale: float = 1.0,
 ) -> list[dict]:
     """
     For each matched (figma_target, live_target) pair, measure the rendered
@@ -292,6 +311,22 @@ def compare_spacing(
     they're just responsive text reflow, not a real mismatch. Vertical (above/
     below) gaps are never affected by this — stacked-content spacing is a real
     defect at any size regardless of element type.
+
+    figma_scale: figma_frame_height / live_page_height. Both sides' y-
+    coordinates are each internally consistent (all Figma nodes share the
+    frame's own space; all live nodes share the live page's own space), but
+    the two spaces are only the SAME absolute scale when the Figma frame and
+    the live page happen to be the same total height — which is rarely true
+    on a real page (the live page commonly renders taller/shorter than the
+    static mock due to real content, dynamic sections, etc.). Comparing a raw
+    Figma-space gap directly against a raw live-space VERTICAL gap without
+    this correction is comparing different units and produces exactly the
+    kind of bogus large "diff" confirmed against a real report — a page
+    where 8 unrelated elements all measured live_gap_px=12 while their
+    Figma-side counterparts scattered from 104 to 2284. Applied only to
+    vertical gaps (above/below): horizontal (left/right) gaps are already in
+    matching units, since the live page is captured at the same width as the
+    Figma frame.
     """
     issues: list[dict] = []
 
@@ -307,15 +342,19 @@ def compare_spacing(
 
         label = ftarget.get(label_field) or ltarget.get(label_field) or "element"
 
-        for direction, f_gap, l_gap, f_neighbor, l_neighbor in (
-            ("above", f_gap_above, l_gap_above, f_above, l_above),
-            ("below", f_gap_below, l_gap_below, f_below, l_below),
-            ("left of", f_gap_left, l_gap_left, f_left, l_left),
-            ("right of", f_gap_right, l_gap_right, f_right, l_right),
+        for direction, f_gap, l_gap, f_neighbor, l_neighbor, is_vertical in (
+            ("above", f_gap_above, l_gap_above, f_above, l_above, True),
+            ("below", f_gap_below, l_gap_below, f_below, l_below, True),
+            ("left of", f_gap_left, l_gap_left, f_left, l_left, False),
+            ("right of", f_gap_right, l_gap_right, f_right, l_right, False),
         ):
             if f_gap is None or l_gap is None:
                 continue
-            diff = abs(f_gap - l_gap)
+            # Compare in a shared coordinate space: convert the live-space
+            # gap into Figma-equivalent units before diffing (vertical only —
+            # see figma_scale docstring above).
+            l_gap_compare = l_gap * figma_scale if is_vertical else l_gap
+            diff = abs(f_gap - l_gap_compare)
             # Flat 2px absolute floor — a gap off by 2px or less is normal
             # rendering noise regardless of how big the gap itself is.
             if diff <= _SPACING_MIN_ABS_PX:
@@ -337,11 +376,19 @@ def compare_spacing(
             figma_region = _union_box(_effective_box(ftarget), _effective_box(f_neighbor)) \
                 if f_neighbor is not None else ftarget
 
+            # Note when the comparison used a scaled live value rather than
+            # the raw one, so "(Xpx off)" doesn't look inconsistent against
+            # the two raw numbers shown right before it.
+            scale_note = (
+                f" (compared as {l_gap_compare:.0f}px after scaling for the "
+                f"page's different total height)"
+                if is_vertical and abs(figma_scale - 1.0) > 0.01 else ""
+            )
             issues.append({
                 "element": f"spacing {direction} {label}"[:80],
                 "description": (
                     f'Spacing {direction} "{label}" is {l_gap:.0f}px on the live site '
-                    f'vs {f_gap:.0f}px in Figma ({diff:.0f}px off).'
+                    f'vs {f_gap:.0f}px in Figma ({diff:.0f}px off{scale_note}).'
                 ),
                 "user_impact": "Inconsistent spacing disrupts visual rhythm and can make the layout feel unpolished.",
                 "suggested_fix": f"Adjust the {direction} spacing to {f_gap:.0f}px to match the Figma spec.",
@@ -404,6 +451,7 @@ def compare_all_spacing(
     live_sections: list[dict] | None = None,
     neighbor_figma_boxes: list[dict] | None = None,
     neighbor_live_boxes: list[dict] | None = None,
+    figma_scale: float = 1.0,
 ) -> list[dict]:
     """
     Run spacing comparison across every element category in one pass:
@@ -428,6 +476,11 @@ def compare_all_spacing(
     omitted, falls back to the target elements themselves (correct only when
     the caller's inputs already cover every possible neighbor, e.g. a
     whole-page run with no section clipping).
+
+    figma_scale: figma_frame_height / live_page_height — see compare_spacing's
+    docstring. Pass the real ratio whenever the caller has it; the default of
+    1.0 (no correction) should only be relied on when the two heights are
+    already known to match.
     """
     figma_sections = _labeled(figma_sections, "name")
     live_sections = _labeled(live_sections, "heading")
@@ -454,9 +507,9 @@ def compare_all_spacing(
     # never suppress.
     issues += compare_spacing(
         all_figma_boxes, all_live_boxes, matched_text, label_field="text",
-        suppress_minor_side_gaps=True,
+        suppress_minor_side_gaps=True, figma_scale=figma_scale,
     )
-    issues += compare_spacing(all_figma_boxes, all_live_boxes, matched_images, label_field="label")
-    issues += compare_spacing(all_figma_boxes, all_live_boxes, matched_buttons, label_field="label")
-    issues += compare_spacing(all_figma_boxes, all_live_boxes, matched_sections, label_field="label")
+    issues += compare_spacing(all_figma_boxes, all_live_boxes, matched_images, label_field="label", figma_scale=figma_scale)
+    issues += compare_spacing(all_figma_boxes, all_live_boxes, matched_buttons, label_field="label", figma_scale=figma_scale)
+    issues += compare_spacing(all_figma_boxes, all_live_boxes, matched_sections, label_field="label", figma_scale=figma_scale)
     return issues

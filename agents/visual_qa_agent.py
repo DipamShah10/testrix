@@ -279,6 +279,17 @@ async def run_visual_qa(
                     + compare_dimensions(figma_button_nodes, live_button_elements, "label", "button")
                 )
 
+                # Real pages rarely render at the same total height as the
+                # static Figma mock — a raw vertical gap from one side isn't
+                # directly comparable to a raw vertical gap from the other
+                # without this correction. See geometry_diff.compare_spacing's
+                # figma_scale docstring for the confirmed real-world bug.
+                page_live_height = max(
+                    (s.get("y", 0) + s.get("height", 0) for s in dom_sections), default=0
+                )
+                page_figma_height = figma_frame.get("height") or page_live_height or 1
+                page_spacing_scale = page_figma_height / page_live_height if page_live_height else 1.0
+
                 # Section-to-section, text-to-text (title/subtitle etc.),
                 # image-to-image, and button spacing — all in one pass, using
                 # the exclusion-filtered sections so header/footer never
@@ -288,6 +299,7 @@ async def run_visual_qa(
                     figma_image_nodes, live_image_elements,
                     figma_button_nodes, live_button_elements,
                     pipeline_figma_sections, pipeline_dom_sections,
+                    figma_scale=page_spacing_scale,
                 )
             except Exception as exc:
                 logger.warning(f"Geometry diff failed for {page_name}: {exc}")
@@ -546,6 +558,7 @@ async def run_single_section_qa(
                     + figma_frame.get("button_nodes", [])
                 ),
                 neighbor_live_boxes=live_text_nodes + live_image_elements + live_button_elements,
+                figma_scale=(figma_frame_height / live_page_height if live_page_height else 1.0),
             )
         except Exception as exc:
             logger.warning(f"Job {job_id}: geometry diff failed for '{target_section}': {exc}")
@@ -564,6 +577,7 @@ async def run_single_section_qa(
                     figma_frame.get("text_nodes", []) + figma_frame.get("image_nodes", [])
                     + figma_frame.get("button_nodes", [])
                 ),
+                figma_frame_height=figma_frame_height,
             )
 
         geometry_issues = dimension_issues + spacing_issues
@@ -653,12 +667,16 @@ async def run_multi_section_qa(
     exclude_sections: list[str] | None = None,
     shopify_password: str | None = None,
     include_typography: bool = True,
+    section_from_end: bool = False,
 ) -> dict:
     """
-    Scoped QA run for the first N real-content sections of a page (e.g.
-    "first 3 sections"), in page order, after dropping any excluded section
-    types (typically header/footer) — so "first 3" means the first 3 sections
-    a visitor would actually scroll through, not the first 3 raw DOM entries.
+    Scoped QA run for the first (or last, with section_from_end=True) N
+    real-content sections of a page (e.g. "first 3 sections" / "last 3
+    sections"), in page order, after dropping any excluded section types
+    (typically header/footer) — so "first 3" means the first 3 sections a
+    visitor would actually scroll through, not the first 3 raw DOM entries,
+    and "last 3" means the closing/contact-adjacent block etc., not
+    whichever 3 entries happen to sort last in the raw DOM.
 
     Each section is scoped independently (own Figma region, own text/image/
     button subset) using the same targeting technique as run_single_section_qa,
@@ -712,8 +730,13 @@ async def run_multi_section_qa(
             shopify_page.get("button_elements", []), live_original_width, frame_width
         )
 
-        await _progress(job_id, "running", f"Selecting first {section_limit} section(s)...")
-        selected_sections = select_first_n_sections(dom_sections, section_limit, exclude_types)
+        await _progress(
+            job_id, "running",
+            f"Selecting {'last' if section_from_end else 'first'} {section_limit} section(s)...",
+        )
+        selected_sections = select_first_n_sections(
+            dom_sections, section_limit, exclude_types, from_end=section_from_end,
+        )
         if not selected_sections:
             await _fail(job_id, "No non-excluded sections found on this page.")
             raise ValueError("No sections selected.")
@@ -727,6 +750,13 @@ async def run_multi_section_qa(
             (s.get("y", 0) + s.get("height", 0) for s in dom_sections), default=0
         )
         figma_frame_height = figma_frame.get("height") or live_page_height or 1
+        # Real pages rarely render at the same total height as the static
+        # Figma mock (more/less real content, dynamic sections, etc.) — a
+        # raw vertical gap from one side isn't directly comparable to a raw
+        # vertical gap from the other without this correction. See
+        # geometry_diff.compare_spacing's figma_scale docstring for the
+        # confirmed real-world bug this fixes.
+        spacing_figma_scale = figma_frame_height / live_page_height if live_page_height else 1.0
 
         # Full-page neighbor pool for spacing checks, built once — an element
         # near a section's own top/bottom edge needs its true nearest
@@ -789,6 +819,7 @@ async def run_multi_section_qa(
                     figma_button_nodes, live_button_in_section,
                     neighbor_figma_boxes=neighbor_figma_boxes,
                     neighbor_live_boxes=neighbor_live_boxes,
+                    figma_scale=spacing_figma_scale,
                 )
             except Exception as exc:
                 logger.warning(f"Job {job_id}: geometry diff failed for '{label}': {exc}")
@@ -1045,6 +1076,7 @@ async def _crossvalidate_geometry_issues(
     spacing_issues: list[dict],
     dimension_issues: list[dict],
     neighbor_figma_boxes: list[dict] | None = None,
+    figma_frame_height: float | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """
     Re-capture the live page at a standard reference desktop width and re-run
@@ -1094,6 +1126,18 @@ async def _crossvalidate_geometry_issues(
         ref_image_in_section = filter_nodes_in_region(ref_image_elements, ref_y0, ref_y1)
         ref_button_in_section = filter_nodes_in_region(ref_button_elements, ref_y0, ref_y1)
 
+        # This reference-width recapture has its OWN total page height,
+        # generally different again from both the original capture's height
+        # and the Figma frame's — same correction as the primary comparison,
+        # see geometry_diff.compare_spacing's figma_scale docstring.
+        ref_page_height = max(
+            (s.get("y", 0) + s.get("height", 0) for s in ref_dom_sections), default=0
+        )
+        ref_spacing_scale = (
+            figma_frame_height / ref_page_height
+            if figma_frame_height and ref_page_height else 1.0
+        )
+
         ref_dimension_issues = (
             compare_dimensions(figma_image_nodes, ref_image_in_section, "label", "image")
             + compare_dimensions(figma_button_nodes, ref_button_in_section, "label", "button")
@@ -1108,6 +1152,7 @@ async def _crossvalidate_geometry_issues(
             figma_button_nodes, ref_button_in_section,
             neighbor_figma_boxes=neighbor_figma_boxes,
             neighbor_live_boxes=ref_text_nodes + ref_image_elements + ref_button_elements,
+            figma_scale=ref_spacing_scale,
         )
         ref_elements = {i["element"] for i in ref_dimension_issues + ref_spacing_issues}
 
